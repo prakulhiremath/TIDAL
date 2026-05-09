@@ -1,288 +1,155 @@
 """
 models/tidal.py
-────────────────
-TIDAL: Temporal AI for Early Detection of Latent Financial Market Instability
+----------------
+TIDAL: Temporal AI for Early Detection of Latent Financial Market Instability.
 
-Main model architecture combining:
-    1. TemporalEncoder  — CNN + BiGRU + self-attention for sequence encoding
-    2. RegimeModule     — Latent market regime inference
-    3. InstabilityHead  — Multi-horizon binary instability prediction
+Model Architecture
+------------------
+TIDAL is a hybrid temporal deep learning model designed for proactive financial
+instability surveillance. It combines structured state-space modelling (for
+capturing persistent regime dynamics) with causal multi-head self-attention
+(for detecting rapid microstructure transitions) through a learned gated fusion.
 
-The model is designed for proactive market surveillance — detecting
-latent instability transitions before they manifest as visible disruption.
+Pipeline:
+    Input (B, T, F)
+      → TemporalEncoder  [SSM branch || Attention branch → gated fusion]
+      → RegimeHead       [per-horizon pooling + MLP classifiers]
+      → Logits (B, H, C) where H=horizons, C=classes
+
+The model predicts the probability of each instability regime {Stable,
+Transitional, Unstable} at each of the configured prediction horizons.
+
+Scientific framing
+------------------
+TIDAL does not predict prices or generate trading signals. The output is
+a multi-horizon instability probability surface, designed to support
+proactive financial surveillance systems. The Transitional class is the
+core novelty: it captures the latent accumulation of microstructure stress
+before visible volatility onset.
+
+Usage
+-----
+    from models.tidal import TIDALModel
+    from utils.config import load_config
+
+    cfg = load_config("configs/default.yaml")
+    model = TIDALModel(cfg)
+    logits = model(x)   # x: (B, T, F), logits: (B, H, C)
+    probs = model.predict_proba(x)  # (B, H, C)
 """
+
+from __future__ import annotations
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from omegaconf import DictConfig
 
 from models.layers.temporal_encoder import TemporalEncoder
-from models.layers.regime_head import RegimeModule, InstabilityHead
+from models.layers.regime_head import RegimeHead
 
 
 class TIDALModel(nn.Module):
-    """
-    TIDAL: Temporal AI for Latent Instability Detection.
+    """Main TIDAL instability surveillance model.
 
-    Architecture:
-        Input sequence (B, T, F)
-            │
-            ▼
-        TemporalEncoder (CNN → BiGRU → Self-Attention)
-            │
-            ├──→ Sequence representation (B, T, H)
-            └──→ Last hidden state (B, H)
-                        │
-                        ▼
-                  RegimeModule
-                  (Latent regime distribution + stress gate)
-                        │
-                        ▼
-                  InstabilityHead
-                  (Multi-horizon binary prediction)
-                        │
-                        ▼
-                  Logits (B, n_horizons)
-
-    The model learns to:
-    1. Encode temporal microstructure patterns
-    2. Infer hidden market regime states
-    3. Predict future instability at multiple horizons
-
-    Usage:
-        model = TIDALModel(input_dim=40, n_horizons=3)
-        output = model(sequences)
-        logits = output['logits']              # (B, n_horizons)
-        regime_probs = output['regime_probs']  # (B, n_regimes)
+    Parameters
+    ----------
+    cfg:
+        Full OmegaConf experiment config. Reads ``model`` and ``data`` sections.
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        # Temporal encoder params
-        cnn_channels: list = [64, 128],
-        cnn_kernel_size: int = 3,
-        rnn_hidden: int = 128,
-        rnn_layers: int = 2,
-        rnn_dropout: float = 0.2,
-        bidirectional: bool = True,
-        use_attention: bool = True,
-        attention_heads: int = 4,
-        # Regime module params
-        n_regimes: int = 3,
-        regime_dim: int = 64,
-        # Instability head params
-        head_hidden_dim: int = 64,
-        n_horizons: int = 3,
-        head_dropout: float = 0.3,
-        # General
-        dropout: float = 0.2,
-    ):
-        """
-        Initialize TIDAL model.
-
-        Args:
-            input_dim: Feature dimension of each LOB snapshot.
-            cnn_channels: Conv channel sizes for temporal encoder.
-            cnn_kernel_size: Convolutional kernel size.
-            rnn_hidden: GRU hidden state size.
-            rnn_layers: Number of stacked GRU layers.
-            rnn_dropout: GRU inter-layer dropout.
-            bidirectional: Use bidirectional GRU.
-            use_attention: Apply self-attention on GRU output.
-            attention_heads: Number of attention heads.
-            n_regimes: Number of latent market regimes.
-            regime_dim: Regime embedding dimension.
-            head_hidden_dim: InstabilityHead MLP hidden size.
-            n_horizons: Number of prediction horizons.
-            head_dropout: Dropout in prediction head.
-            dropout: General dropout rate.
-        """
+    def __init__(self, cfg: DictConfig) -> None:
         super().__init__()
+        mc = cfg.model
+        tc = mc.tidal
 
-        self.input_dim = input_dim
-        self.n_horizons = n_horizons
-        self.n_regimes = n_regimes
+        self.num_horizons = len(cfg.data.horizons)
+        self.num_classes  = mc.num_classes
+        self.horizons     = list(cfg.data.horizons)
 
-        # ── Temporal Encoder ────────────────────────────────────────────────
-        self.temporal_encoder = TemporalEncoder(
-            input_dim=input_dim,
-            cnn_channels=cnn_channels,
-            rnn_hidden=rnn_hidden,
-            rnn_layers=rnn_layers,
-            rnn_dropout=rnn_dropout,
-            bidirectional=bidirectional,
-            use_attention=use_attention,
-            attention_heads=attention_heads,
-            dropout=dropout,
-        )
-        enc_dim = self.temporal_encoder.output_dim
-
-        # ── Regime Module ───────────────────────────────────────────────────
-        self.regime_module = RegimeModule(
-            input_dim=enc_dim,
-            n_regimes=n_regimes,
-            regime_dim=regime_dim,
-            dropout=dropout,
+        # ── Temporal encoder ──────────────────────────────────────────────
+        self.encoder = TemporalEncoder(
+            input_dim    = mc.input_dim,
+            hidden_dim   = mc.hidden_dim,
+            ssm_state_dim= tc.ssm_dim,
+            ssm_layers   = tc.ssm_layers,
+            attn_layers  = tc.attn_layers,
+            num_heads    = mc.num_heads,
+            dropout      = mc.dropout,
         )
 
-        # ── Instability Head ────────────────────────────────────────────────
-        head_input_dim = enc_dim + regime_dim
-        self.instability_head = InstabilityHead(
-            input_dim=head_input_dim,
-            hidden_dim=head_hidden_dim,
-            n_horizons=n_horizons,
-            dropout=head_dropout,
+        # ── Multi-horizon regime head ─────────────────────────────────────
+        self.head = RegimeHead(
+            hidden_dim   = mc.hidden_dim,
+            num_horizons = self.num_horizons,
+            num_classes  = mc.num_classes,
+            dropout      = mc.dropout,
+            share_mlp    = False,
         )
 
         self._init_weights()
 
-    def forward(
-        self, x: torch.Tensor, return_intermediates: bool = False
-    ) -> Dict[str, torch.Tensor]:
+    def _init_weights(self) -> None:
+        """Initialise linear layers with Xavier uniform, biases to zero."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : (B, T, F) — normalised feature sequences
+
+        Returns
+        -------
+        logits : (B, num_horizons, num_classes)
         """
-        Forward pass.
+        encoded = self.encoder(x)     # (B, T, hidden_dim)
+        logits  = self.head(encoded)  # (B, H, C)
+        return logits
 
-        Args:
-            x: Input sequence tensor (batch, seq_len, input_dim).
-            return_intermediates: If True, include encoder outputs in result.
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        """Return softmax probabilities.
 
-        Returns:
-            Dictionary containing:
-                - 'logits': Raw predictions (batch, n_horizons)
-                - 'probs': Sigmoid probabilities (batch, n_horizons)
-                - 'regime_probs': Regime distribution (batch, n_regimes)
-                - 'regime_repr': Regime embedding (batch, regime_dim) [if return_intermediates]
-                - 'sequence_encoding': Full sequence output (batch, T, H) [if return_intermediates]
+        Returns
+        -------
+        probs : (B, num_horizons, num_classes) in [0, 1]
         """
-        # ── Temporal encoding ───────────────────────────────────────────────
-        sequence_enc, last_hidden = self.temporal_encoder(x, return_sequence=True)
-
-        # Use the last time step's encoding for regime inference
-        # (Captures accumulated temporal context)
-        context = sequence_enc[:, -1, :]             # (B, H)
-
-        # ── Regime inference ────────────────────────────────────────────────
-        regime_repr, regime_probs = self.regime_module(context)  # (B, R), (B, n_reg)
-
-        # ── Instability prediction ──────────────────────────────────────────
-        combined = torch.cat([context, regime_repr], dim=-1)     # (B, H+R)
-        logits = self.instability_head(combined)                 # (B, n_horizons)
-        probs = torch.sigmoid(logits)
-
-        output = {
-            "logits": logits,
-            "probs": probs,
-            "regime_probs": regime_probs,
-        }
-
-        if return_intermediates:
-            output["sequence_encoding"] = sequence_enc
-            output["regime_repr"] = regime_repr
-            output["last_hidden"] = last_hidden
-
-        return output
-
-    def predict_instability(
-        self, x: torch.Tensor, threshold: float = 0.5
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Convenience method: predict instability labels.
-
-        Args:
-            x: Input sequence (batch, seq_len, input_dim).
-            threshold: Decision threshold for binary prediction.
-
-        Returns:
-            Dict with 'probs', 'labels', 'regime_probs'.
-        """
-        self.eval()
         with torch.no_grad():
-            output = self.forward(x)
-        output["labels"] = (output["probs"] > threshold).long()
-        return output
+            logits = self.forward(x)
+        return F.softmax(logits, dim=-1)
 
-    def get_attention_weights(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+    def predict_instability_score(self, x: torch.Tensor) -> torch.Tensor:
+        """Return a scalar instability score in [0, 1] per horizon.
+
+        Computed as P(Transitional) + P(Unstable) — the probability that
+        the market is *not* in a stable regime. This is the primary output
+        for surveillance dashboards.
+
+        Returns
+        -------
+        score : (B, num_horizons)
         """
-        Extract attention weights for visualization.
-
-        Args:
-            x: Input sequence (batch, seq_len, input_dim).
-
-        Returns:
-            Attention weight tensor or None if attention disabled.
-        """
-        if not self.temporal_encoder.use_attention:
-            return None
-
-        self.eval()
-        with torch.no_grad():
-            # Access internal attention module
-            x_cnn = x.permute(0, 2, 1)
-            x_cnn = self.temporal_encoder.cnn(x_cnn)
-            x_cnn = x_cnn.permute(0, 2, 1)
-
-            gru_out, _ = self.temporal_encoder.gru(x_cnn)
-            gru_out = self.temporal_encoder.rnn_norm(gru_out)
-
-            _, attn_weights = self.temporal_encoder.attention(
-                gru_out, gru_out, gru_out
-            )
-        return attn_weights  # (B, T, T)
+        probs = self.predict_proba(x)
+        return probs[:, :, 1:].sum(dim=-1)  # P(trans) + P(unstable)
 
     def count_parameters(self) -> int:
-        """Return total trainable parameter count."""
+        """Return total number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def _init_weights(self) -> None:
-        """Initialize weights with sensible defaults."""
-        for name, param in self.named_parameters():
-            if "weight" in name and param.dim() > 1:
-                nn.init.xavier_uniform_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
 
     def __repr__(self) -> str:
         return (
-            f"TIDALModel(\n"
-            f"  input_dim={self.input_dim},\n"
-            f"  n_horizons={self.n_horizons},\n"
-            f"  n_regimes={self.n_regimes},\n"
-            f"  encoder={self.temporal_encoder.output_dim}d,\n"
-            f"  params={self.count_parameters():,}\n"
-            f")"
+            f"TIDALModel("
+            f"horizons={self.horizons}, "
+            f"classes={self.num_classes}, "
+            f"params={self.count_parameters():,})"
         )
-
-
-def build_tidal_from_config(cfg: dict, input_dim: int) -> "TIDALModel":
-    """
-    Instantiate TIDALModel from a config dictionary.
-
-    Args:
-        cfg: Model configuration dict (from YAML).
-        input_dim: Feature dimension (set at runtime from data).
-
-    Returns:
-        Instantiated TIDALModel.
-    """
-    enc_cfg = cfg.get("temporal_encoder", {})
-    reg_cfg = cfg.get("regime_module", {})
-    head_cfg = cfg.get("instability_head", {})
-
-    return TIDALModel(
-        input_dim=input_dim,
-        cnn_channels=enc_cfg.get("cnn_channels", [64, 128]),
-        cnn_kernel_size=enc_cfg.get("cnn_kernel_size", 3),
-        rnn_hidden=enc_cfg.get("rnn_hidden", 128),
-        rnn_layers=enc_cfg.get("rnn_layers", 2),
-        rnn_dropout=enc_cfg.get("rnn_dropout", 0.2),
-        bidirectional=enc_cfg.get("bidirectional", True),
-        use_attention=reg_cfg.get("use_attention", True),
-        attention_heads=reg_cfg.get("attention_heads", 4),
-        n_regimes=reg_cfg.get("n_regimes", 3),
-        regime_dim=reg_cfg.get("regime_dim", 64),
-        head_hidden_dim=head_cfg.get("hidden_dim", 64),
-        n_horizons=head_cfg.get("n_horizons", 3),
-        head_dropout=head_cfg.get("dropout", 0.3),
-    )
