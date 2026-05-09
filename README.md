@@ -7,8 +7,6 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Paper](https://img.shields.io/badge/paper-arXiv-red.svg)](#citation)
-
 ---
 
 ## Overview
@@ -301,19 +299,6 @@ Random seeds are applied to: Python, NumPy, PyTorch (CPU + CUDA).
 - [ ] Causal structure discovery in instability propagation
 - [ ] Integration with real-time market surveillance APIs
 - [ ] Cross-market generalization studies
-
----
-
-## Citation
-
-```bibtex
-@inproceedings{tidal2024,
-  title     = {TIDAL: Temporal AI for Early Detection of Latent Financial Market Instability},
-  author    = {Author, A. and Author, B.},
-  booktitle = {Proceedings of the International Conference on Machine Learning (ICML)},
-  year      = {2024}
-}
-```
 
 ---
 
