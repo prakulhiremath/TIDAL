@@ -1,0 +1,22 @@
+# TIDAL LSTM Baseline Configuration
+# Inherits defaults, overrides model-specific settings
+
+defaults:
+  - default
+
+model:
+  name: "lstm"
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  bidirectional: true
+  fc_hidden: 64
+
+training:
+  batch_size: 256
+  max_epochs: 80
+  learning_rate: 0.001
+
+loss:
+  name: "focal"
+  focal_gamma: 2.0
