@@ -1,0 +1,24 @@
+# TIDAL SSM Baseline Configuration (Structured State Space Model)
+
+defaults:
+  - default
+
+model:
+  name: "ssm"
+  d_model: 128
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  num_layers: 3
+  dropout: 0.1
+  fc_hidden: 64
+
+training:
+  batch_size: 128
+  max_epochs: 80
+  learning_rate: 0.001
+  scheduler: "cosine"
+
+loss:
+  name: "focal"
+  focal_gamma: 2.0
