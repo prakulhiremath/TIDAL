@@ -1,100 +1,126 @@
 """
 utils/logger.py
-───────────────
-Structured logging configuration for TIDAL experiments.
-Uses loguru for rich console output and file logging.
+---------------
+Logging utilities for TIDAL experiments.
+
+Provides a pre-configured loguru logger with optional Rich console output
+and file sink. All experiment scripts import ``get_logger`` and use it
+instead of print statements.
 """
+
+from __future__ import annotations
 
 import sys
 from pathlib import Path
-from loguru import logger
 from typing import Optional
+
+from loguru import logger
+
+
+# Default format strings
+_CONSOLE_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+    "<level>{level: <8}</level> | "
+    "<cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>"
+)
+
+_FILE_FORMAT = (
+    "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} — {message}"
+)
 
 
 def setup_logger(
-    log_dir: Optional[str] = None,
+    log_dir: Optional[str | Path] = None,
     experiment_name: str = "tidal",
     level: str = "INFO",
-    rotation: str = "10 MB",
+    rich_console: bool = True,
 ) -> None:
+    """Configure the global loguru logger.
+
+    Should be called once at the start of each experiment script. Subsequent
+    calls to ``get_logger()`` anywhere in the codebase will use this config.
+
+    Parameters
+    ----------
+    log_dir:
+        Directory to write the log file. If None, file logging is disabled.
+    experiment_name:
+        Used as the log file name stem: ``<log_dir>/<experiment_name>.log``.
+    level:
+        Minimum log level: "DEBUG" | "INFO" | "WARNING" | "ERROR".
+    rich_console:
+        If True, attempts to use Rich for colourised console output.
     """
-    Configure loguru logger with console and optional file sinks.
+    logger.remove()  # Remove default handler
 
-    Args:
-        log_dir: Directory to write log files. None = console only.
-        experiment_name: Name prefix for log files.
-        level: Logging level (DEBUG, INFO, WARNING, ERROR).
-        rotation: File rotation policy.
-    """
-    # Remove default handler
-    logger.remove()
+    if rich_console:
+        try:
+            from rich.logging import RichHandler
+            import logging
 
-    # Rich console handler
-    console_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
-        "<level>{message}</level>"
-    )
-    logger.add(sys.stderr, format=console_format, level=level, colorize=True)
+            logging.basicConfig(
+                level=level,
+                format="%(message)s",
+                datefmt="[%X]",
+                handlers=[RichHandler(rich_tracebacks=True, markup=True)],
+            )
+            # Bridge loguru → stdlib so Rich picks it up
+            logger.add(
+                lambda msg: logging.getLogger("tidal").info(msg, stacklevel=8),
+                format="{message}",
+                level=level,
+                colorize=False,
+            )
+        except ImportError:
+            rich_console = False
 
-    # File handler
-    if log_dir is not None:
-        log_path = Path(log_dir)
-        log_path.mkdir(parents=True, exist_ok=True)
-
-        file_format = (
-            "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
-            "{name}:{function}:{line} | {message}"
-        )
-        log_file = log_path / f"{experiment_name}.log"
+    if not rich_console:
         logger.add(
-            log_file,
-            format=file_format,
+            sys.stderr,
+            format=_CONSOLE_FORMAT,
             level=level,
-            rotation=rotation,
-            compression="zip",
+            colorize=True,
         )
-        logger.info(f"Logging to file: {log_file}")
 
-    logger.info(f"Logger initialized [level={level}]")
+    if log_dir is not None:
+        log_path = Path(log_dir) / f"{experiment_name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_path),
+            format=_FILE_FORMAT,
+            level=level,
+            rotation="50 MB",
+            retention="30 days",
+            encoding="utf-8",
+        )
 
 
-def log_config(config: dict) -> None:
+def get_logger(name: str = "tidal") -> "logger":  # type: ignore[return]
+    """Return a loguru logger bound to a module name.
+
+    Usage::
+
+        log = get_logger(__name__)
+        log.info("Training started")
     """
-    Pretty-print experiment configuration to log.
+    return logger.bind(name=name)
 
-    Args:
-        config: Configuration dictionary.
+
+def log_config(cfg: object, log: Optional[object] = None) -> None:
+    """Pretty-print an OmegaConf config to the logger.
+
+    Parameters
+    ----------
+    cfg:
+        OmegaConf DictConfig or any object with a sensible ``str()`` repr.
+    log:
+        Logger instance. If None, uses the module-level logger.
     """
-    logger.info("=" * 60)
-    logger.info("EXPERIMENT CONFIGURATION")
-    logger.info("=" * 60)
-    _log_dict(config, indent=0)
-    logger.info("=" * 60)
+    from omegaconf import OmegaConf
 
-
-def _log_dict(d: dict, indent: int = 0) -> None:
-    """Recursively log dictionary contents."""
-    prefix = "  " * indent
-    for key, value in d.items():
-        if isinstance(value, dict):
-            logger.info(f"{prefix}{key}:")
-            _log_dict(value, indent + 1)
-        else:
-            logger.info(f"{prefix}{key}: {value}")
-
-
-def log_metrics(metrics: dict, step: Optional[int] = None, prefix: str = "") -> None:
-    """
-    Log a dictionary of metrics.
-
-    Args:
-        metrics: Metric name → value mapping.
-        step: Optional step/epoch number.
-        prefix: Prefix string (e.g. 'train', 'val').
-    """
-    step_str = f" [step={step}]" if step is not None else ""
-    prefix_str = f"[{prefix}] " if prefix else ""
-    parts = [f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in metrics.items()]
-    logger.info(f"{prefix_str}{step_str} {' | '.join(parts)}")
+    _log = log or logger
+    try:
+        cfg_str = OmegaConf.to_yaml(cfg)
+    except Exception:
+        cfg_str = str(cfg)
+    _log.info("Experiment configuration:\n" + cfg_str)
