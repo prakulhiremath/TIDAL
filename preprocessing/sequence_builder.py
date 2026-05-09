@@ -1,263 +1,191 @@
 """
 preprocessing/sequence_builder.py
-───────────────────────────────────
-Sliding window sequence construction for temporal models.
+-----------------------------------
+Boundary-safe sliding window sequence construction for TIDAL.
 
-Converts time-series features and labels into fixed-length sequences
-suitable for LSTM, Transformer, and TIDAL model training.
+Data leakage prevention
+-----------------------
+The train/val/test split is performed on **raw timestamps** BEFORE sequences
+are built. Sequences are then constructed independently within each fold.
+This ensures that no sequence contains data from both sides of a fold boundary.
+
+Sequence structure
+------------------
+For each valid step t:
+    X[t]  = features[t - seq_len + 1 : t + 1]   shape: (seq_len, F)
+    y[t]  = labels[t]                             shape: (H,)   H = num horizons
+
+Steps where labels[t] == -1 (masked) are excluded from all folds.
+
+Usage
+-----
+    builder = SequenceBuilder(cfg)
+    X_train, y_train = builder.build(features_train, labels_train)
+    # X_train: (N_train, seq_len, F)
+    # y_train: (N_train, H)
 """
 
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Dict, Optional, Tuple
-from loguru import logger
-
-
-class LOBSequenceDataset(Dataset):
-    """
-    PyTorch Dataset for LOB sequence data with multi-horizon labels.
-
-    Each sample is a tuple:
-        (sequence, labels_dict)
-    where sequence has shape (window_size, n_features) and
-    labels_dict maps horizon → binary scalar.
-
-    Usage:
-        dataset = LOBSequenceDataset(features, labels, window_size=50)
-        loader = DataLoader(dataset, batch_size=256, shuffle=True)
-    """
-
-    def __init__(
-        self,
-        features: np.ndarray,
-        labels: Dict[str, np.ndarray],
-        window_size: int = 50,
-        stride: int = 1,
-        horizons: List[int] = [10, 30, 60],
-        dtype: torch.dtype = torch.float32,
-    ):
-        """
-        Initialize sequence dataset.
-
-        Args:
-            features: Feature array (T, n_features).
-            labels: Dictionary of label arrays, each shape (T,).
-            window_size: Input sequence length.
-            stride: Step size between sequences.
-            horizons: Prediction horizons to include as labels.
-            dtype: PyTorch data type.
-        """
-        self.features = features.astype(np.float32)
-        self.labels = labels
-        self.window_size = window_size
-        self.stride = stride
-        self.horizons = horizons
-        self.dtype = dtype
-
-        # Precompute valid sequence start indices
-        T = len(features)
-        max_horizon = max(horizons) if horizons else 0
-        self.indices = list(range(0, T - window_size - max_horizon + 1, stride))
-
-        logger.debug(
-            f"Dataset: T={T}, window={window_size}, stride={stride}, "
-            f"n_sequences={len(self.indices)}"
-        )
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Retrieve a sequence and its labels.
-
-        Args:
-            idx: Dataset index.
-
-        Returns:
-            Tuple of (sequence_tensor, label_dict).
-            sequence_tensor shape: (window_size, n_features)
-            label_dict: horizon_name → scalar tensor
-        """
-        start = self.indices[idx]
-        end = start + self.window_size
-
-        seq = torch.tensor(self.features[start:end], dtype=self.dtype)
-
-        label_dict = {}
-        # "instability_now" is labeled at the END of the input window
-        if "instability_now" in self.labels:
-            label_dict["instability_now"] = torch.tensor(
-                self.labels["instability_now"][end - 1], dtype=torch.float32
-            )
-
-        for h in self.horizons:
-            key = f"instability_h{h}"
-            if key in self.labels:
-                label_dict[key] = torch.tensor(
-                    self.labels[key][end - 1], dtype=torch.float32
-                )
-
-        return seq, label_dict
-
-    def get_class_weights(self, horizon: int = 10) -> torch.Tensor:
-        """
-        Compute class weights for imbalanced instability labels.
-
-        Args:
-            horizon: Which horizon to compute weights for.
-
-        Returns:
-            Tensor of shape (2,) with [weight_stable, weight_unstable].
-        """
-        key = f"instability_h{horizon}"
-        if key not in self.labels:
-            key = "instability_now"
-
-        valid_labels = np.array([
-            self.labels[key][self.indices[i] + self.window_size - 1]
-            for i in range(len(self.indices))
-        ])
-        n_pos = valid_labels.sum()
-        n_neg = len(valid_labels) - n_pos
-        if n_pos == 0 or n_neg == 0:
-            return torch.tensor([1.0, 1.0])
-
-        w_neg = len(valid_labels) / (2 * n_neg)
-        w_pos = len(valid_labels) / (2 * n_pos)
-        return torch.tensor([w_neg, w_pos], dtype=torch.float32)
+from omegaconf import DictConfig
+from torch.utils.data import Dataset
 
 
 class SequenceBuilder:
-    """
-    High-level API for building train/val/test sequence loaders.
+    """Build sliding-window sequences from feature and label arrays.
 
-    Usage:
-        builder = SequenceBuilder(window_size=50, horizons=[10, 30, 60])
-        train_loader, val_loader, test_loader = builder.build_loaders(
-            train_features, val_features, test_features,
-            train_labels, val_labels, test_labels,
-        )
+    Parameters
+    ----------
+    cfg:
+        OmegaConf config containing ``data.seq_len`` and ``data.step_size``.
+    """
+
+    def __init__(self, cfg: DictConfig) -> None:
+        self.seq_len  = cfg.data.seq_len
+        self.step_size = cfg.data.get("step_size", 1)
+
+    def build(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        return_indices: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Construct aligned (X, y) sequence pairs.
+
+        Parameters
+        ----------
+        features:
+            Float array of shape (T, F). Features for a single fold.
+        labels:
+            Int8 array of shape (T, H) or (T,). -1 = masked/excluded.
+        return_indices:
+            If True, also return the original time indices of the sequences.
+
+        Returns
+        -------
+        X : (N, seq_len, F)
+        y : (N, H) or (N,)
+        indices : (N,)  — only if return_indices=True
+        """
+        T, F = features.shape
+        if labels.ndim == 1:
+            labels = labels[:, np.newaxis]
+        H = labels.shape[1]
+
+        # Minimum index where a full sequence can be formed
+        start = self.seq_len - 1
+
+        X_list, y_list, idx_list = [], [], []
+
+        for t in range(start, T, self.step_size):
+            lab = labels[t]
+            # Exclude masked steps (any horizon masked → exclude entire step)
+            if np.any(lab == -1):
+                continue
+            seq = features[t - self.seq_len + 1 : t + 1]  # (seq_len, F)
+            X_list.append(seq)
+            y_list.append(lab)
+            idx_list.append(t)
+
+        if not X_list:
+            raise ValueError(
+                f"No valid sequences found. Check seq_len={self.seq_len} "
+                f"vs T={T} and label masks."
+            )
+
+        X = np.stack(X_list, axis=0).astype(np.float32)   # (N, seq_len, F)
+        y = np.stack(y_list, axis=0).astype(np.int64)      # (N, H)
+        indices = np.array(idx_list, dtype=np.int64)
+
+        if return_indices:
+            return X, y, indices
+        return X, y
+
+
+class InstabilityDataset(Dataset):
+    """PyTorch Dataset wrapping sequence arrays for DataLoader compatibility.
+
+    Parameters
+    ----------
+    X:
+        Feature sequences, shape (N, seq_len, F).
+    y:
+        Labels, shape (N, H) where H = number of horizons.
+    horizon_idx:
+        If not None, extract only one horizon: y becomes (N,).
     """
 
     def __init__(
         self,
-        window_size: int = 50,
-        stride: int = 1,
-        horizons: List[int] = [10, 30, 60],
-        batch_size: int = 256,
-        num_workers: int = 4,
-    ):
-        """
-        Initialize sequence builder.
+        X: np.ndarray,
+        y: np.ndarray,
+        horizon_idx: Optional[int] = None,
+    ) -> None:
+        import torch
+        self.X = torch.from_numpy(X)                  # float32
+        if horizon_idx is not None:
+            self.y = torch.from_numpy(y[:, horizon_idx]).long()
+        else:
+            self.y = torch.from_numpy(y).long()       # (N, H) or (N,)
 
-        Args:
-            window_size: Temporal input window length.
-            stride: Sliding window stride.
-            horizons: Prediction horizons.
-            batch_size: DataLoader batch size.
-            num_workers: DataLoader worker count.
-        """
-        self.window_size = window_size
-        self.stride = stride
-        self.horizons = horizons
-        self.batch_size = batch_size
-        self.num_workers = num_workers
+    def __len__(self) -> int:
+        return len(self.X)
 
-    def build_loaders(
-        self,
-        train_feats: np.ndarray,
-        val_feats: np.ndarray,
-        test_feats: np.ndarray,
-        train_labels: Dict[str, np.ndarray],
-        val_labels: Dict[str, np.ndarray],
-        test_labels: Dict[str, np.ndarray],
-    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-        """
-        Build DataLoaders for train, validation, and test splits.
+    def __getitem__(self, idx: int):
+        return self.X[idx], self.y[idx]
 
-        Args:
-            train_feats: Training features (T_train, F).
-            val_feats: Validation features (T_val, F).
-            test_feats: Test features (T_test, F).
-            train_labels: Training label dictionary.
-            val_labels: Validation label dictionary.
-            test_labels: Test label dictionary.
 
-        Returns:
-            Tuple of (train_loader, val_loader, test_loader).
-        """
-        train_ds = LOBSequenceDataset(
-            train_feats, train_labels, self.window_size, self.stride, self.horizons
-        )
-        val_ds = LOBSequenceDataset(
-            val_feats, val_labels, self.window_size, stride=1, horizons=self.horizons
-        )
-        test_ds = LOBSequenceDataset(
-            test_feats, test_labels, self.window_size, stride=1, horizons=self.horizons
-        )
+def make_dataloaders(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    cfg: DictConfig,
+    seed: int = 42,
+):
+    """Build train / val / test DataLoaders.
 
-        logger.info(
-            f"Datasets: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}"
-        )
+    Returns
+    -------
+    Tuple of (train_loader, val_loader, test_loader).
+    """
+    import torch
+    from torch.utils.data import DataLoader
+    from utils.seed import seed_worker, make_generator
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=self.batch_size * 2,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-        )
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=self.batch_size * 2,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-        )
-        return train_loader, val_loader, test_loader
+    g = make_generator(seed)
 
-    def build_numpy_sequences(
-        self,
-        features: np.ndarray,
-        labels: Dict[str, np.ndarray],
-        horizon: int = 10,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Build flat NumPy sequences for sklearn-compatible models.
+    train_ds = InstabilityDataset(X_train, y_train)
+    val_ds   = InstabilityDataset(X_val,   y_val)
+    test_ds  = InstabilityDataset(X_test,  y_test)
 
-        Args:
-            features: Feature array (T, F).
-            labels: Label dictionary.
-            horizon: Which horizon label to use.
-
-        Returns:
-            Tuple of (X, y) where X has shape (n_seq, window_size * F).
-        """
-        T, F = features.shape
-        label_key = f"instability_h{horizon}" if f"instability_h{horizon}" in labels else "instability_now"
-        label_arr = labels[label_key]
-
-        max_h = horizon
-        valid_start = list(range(0, T - self.window_size - max_h + 1, self.stride))
-        n_seq = len(valid_start)
-
-        X = np.zeros((n_seq, self.window_size * F), dtype=np.float32)
-        y = np.zeros(n_seq, dtype=int)
-
-        for i, start in enumerate(valid_start):
-            end = start + self.window_size
-            X[i] = features[start:end].flatten()
-            y[i] = label_arr[end - 1]
-
-        logger.debug(f"Built {n_seq} numpy sequences: X={X.shape}, y={y.shape}")
-        return X, y
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=g,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.evaluation.get("batch_size", 256),
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.evaluation.get("batch_size", 256),
+        shuffle=False,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return train_loader, val_loader, test_loader
