@@ -1,160 +1,170 @@
 """
 models/layers/regime_head.py
-─────────────────────────────
-Instability prediction head with latent regime representation.
+-----------------------------
+Multi-horizon instability prediction head for TIDAL.
 
-Components:
-    - RegimeModule: Infers latent market regime (Stable/Transitional/Unstable)
-    - InstabilityHead: Multi-horizon binary prediction head
+The regime head consumes the temporal encoder's output and independently
+predicts the probability of each instability regime at multiple prediction
+horizons (e.g. 10, 30, 60 steps ahead).
+
+Architecture
+------------
+For each horizon H, a separate lightweight MLP maps the pooled encoder
+representation to class logits. The three classes are:
+    0: Stable
+    1: Transitional  (the scientific novelty — early warning region)
+    2: Unstable
+
+Pooling strategy: The encoder produces per-step representations (B, T, D).
+We apply adaptive temporal pooling that combines:
+    - Last hidden state h_T     (captures current regime)
+    - Mean pooling h_mean       (captures average trajectory)
+    - Max pooling h_max         (captures worst-case microstructure)
+
+This gives a richer aggregate than using h_T alone, which can miss sustained
+stress that decays slightly before the window end.
+
+Input  : (B, T, hidden_dim)  — from TemporalEncoder
+Output : list of (B, num_classes) tensors, one per horizon
+         or stacked: (B, num_horizons, num_classes)
 """
+
+from __future__ import annotations
+
+from typing import List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
 
 
-class RegimeModule(nn.Module):
-    """
-    Latent regime inference module.
+class HorizonHead(nn.Module):
+    """Single-horizon classification head.
 
-    Given the temporal encoding, this module infers a soft distribution
-    over market regimes and produces a regime-conditioned representation.
-
-    Regimes:
-        0: Stable       — normal low-volatility market
-        1: Transitional — stress accumulating, not yet unstable
-        2: Unstable     — active instability episode
-
-    This module is NOT directly supervised — it learns through backpropagation
-    from the instability prediction task. The regime distribution emerges as
-    a latent variable that the model finds useful.
+    Parameters
+    ----------
+    hidden_dim:  Input dimension from encoder.
+    num_classes: Number of regime classes (3).
+    pooled_dim:  Dimension of the pooled representation (3 * hidden_dim by default).
+    dropout:     Dropout probability.
     """
 
     def __init__(
         self,
-        input_dim: int,
-        n_regimes: int = 3,
-        regime_dim: int = 64,
-        dropout: float = 0.2,
-    ):
-        """
-        Args:
-            input_dim: Dimension of temporal encoder output.
-            n_regimes: Number of latent market regimes.
-            regime_dim: Regime embedding dimension.
-            dropout: Dropout rate.
-        """
+        hidden_dim: int,
+        num_classes: int = 3,
+        pooled_dim: Optional[int] = None,
+        dropout: float = 0.1,
+    ) -> None:
+        from typing import Optional
         super().__init__()
-        self.n_regimes = n_regimes
-        self.regime_dim = regime_dim
-
-        # Regime classifier (soft assignment)
-        self.regime_classifier = nn.Sequential(
-            nn.Linear(input_dim, regime_dim),
+        pooled_dim = pooled_dim or (3 * hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(pooled_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(regime_dim, n_regimes),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_dim // 2, num_classes),
         )
 
-        # Regime prototype embeddings (learned)
-        self.regime_prototypes = nn.Embedding(n_regimes, regime_dim)
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        """pooled: (B, pooled_dim) → logits: (B, num_classes)"""
+        return self.mlp(pooled)
 
-        # Stress accumulation gate
-        self.stress_gate = nn.Sequential(
-            nn.Linear(input_dim, regime_dim),
-            nn.Sigmoid(),
-        )
 
-        self.norm = nn.LayerNorm(regime_dim)
-        self.output_dim = regime_dim
+class RegimeHead(nn.Module):
+    """Multi-horizon instability regime prediction head.
+
+    Parameters
+    ----------
+    hidden_dim:   Encoder output dimension.
+    num_horizons: Number of prediction horizons (e.g. 3 for [10, 30, 60]).
+    num_classes:  Number of regime classes (default 3).
+    dropout:      Dropout probability.
+    share_mlp:    If True, all horizons share MLP weights (reduces parameters
+                  but may degrade longer-horizon accuracy).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_horizons: int = 3,
+        num_classes: int = 3,
+        dropout: float = 0.1,
+        share_mlp: bool = False,
+    ) -> None:
+        super().__init__()
+        self.hidden_dim   = hidden_dim
+        self.num_horizons = num_horizons
+        self.num_classes  = num_classes
+        pooled_dim = 3 * hidden_dim  # last + mean + max
+
+        if share_mlp:
+            # Shared MLP + horizon embedding to distinguish horizons
+            self.horizon_embed = nn.Embedding(num_horizons, hidden_dim)
+            _head = HorizonHead(hidden_dim, num_classes, pooled_dim + hidden_dim, dropout)
+            self.heads = nn.ModuleList([_head] * num_horizons)
+            self._share_mlp = True
+        else:
+            self.heads = nn.ModuleList([
+                HorizonHead(hidden_dim, num_classes, pooled_dim, dropout)
+                for _ in range(num_horizons)
+            ])
+            self._share_mlp = False
+
+        # Temporal attention pooling weights (learned)
+        self.temporal_attn = nn.Linear(hidden_dim, 1)
+
+    def _pool(self, encoded: torch.Tensor) -> torch.Tensor:
+        """Adaptive temporal pooling: concatenate last + mean + attn-weighted.
+
+        Parameters
+        ----------
+        encoded : (B, T, hidden_dim)
+
+        Returns
+        -------
+        pooled : (B, 3 * hidden_dim)
+        """
+        # Last hidden state
+        h_last = encoded[:, -1, :]                    # (B, D)
+
+        # Attention-weighted mean (replaces simple mean for richer aggregation)
+        attn_w = torch.softmax(self.temporal_attn(encoded), dim=1)  # (B, T, 1)
+        h_mean = (encoded * attn_w).sum(dim=1)        # (B, D)
+
+        # Max pooling across time (captures worst-case stress signal)
+        h_max, _ = encoded.max(dim=1)                 # (B, D)
+
+        return torch.cat([h_last, h_mean, h_max], dim=-1)  # (B, 3D)
 
     def forward(
-        self, encoded: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Infer regime distribution and produce regime-conditioned representation.
-
-        Args:
-            encoded: Temporal encoding (batch, input_dim).
-
-        Returns:
-            Tuple of:
-                - regime_repr: Regime-conditioned representation (batch, regime_dim)
-                - regime_probs: Soft regime probabilities (batch, n_regimes)
-        """
-        # Soft regime assignment
-        logits = self.regime_classifier(encoded)          # (B, n_regimes)
-        regime_probs = F.softmax(logits, dim=-1)          # (B, n_regimes)
-
-        # Weighted combination of regime prototypes
-        # regime_prototypes: (n_regimes, regime_dim)
-        proto = self.regime_prototypes.weight              # (n_regimes, regime_dim)
-        regime_repr = torch.matmul(regime_probs, proto)   # (B, regime_dim)
-
-        # Stress accumulation modulation
-        gate = self.stress_gate(encoded)                  # (B, regime_dim)
-        regime_repr = self.norm(regime_repr * gate)       # (B, regime_dim)
-
-        return regime_repr, regime_probs
-
-
-class InstabilityHead(nn.Module):
-    """
-    Multi-horizon instability prediction head.
-
-    Predicts binary instability probability for each configured horizon.
-    Takes the concatenation of temporal encoding and regime representation.
-    """
-
-    def __init__(
         self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        n_horizons: int = 3,
-        dropout: float = 0.3,
-    ):
+        encoded: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Args:
-            input_dim: Concatenated encoder + regime dimension.
-            hidden_dim: MLP hidden dimension.
-            n_horizons: Number of prediction horizons.
-            dropout: Dropout rate.
+        Parameters
+        ----------
+        encoded : (B, T, hidden_dim)
+
+        Returns
+        -------
+        logits : (B, num_horizons, num_classes)
         """
-        super().__init__()
-        self.n_horizons = n_horizons
+        pooled = self._pool(encoded)  # (B, 3D)
 
-        # Shared feature extractor
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.LayerNorm(hidden_dim),
-        )
+        horizon_logits = []
+        for h_idx, head in enumerate(self.heads):
+            if self._share_mlp:
+                h_emb = self.horizon_embed(
+                    torch.tensor(h_idx, device=encoded.device)
+                ).unsqueeze(0).expand(pooled.size(0), -1)  # (B, D)
+                inp = torch.cat([pooled, h_emb], dim=-1)
+            else:
+                inp = pooled
+            horizon_logits.append(head(inp))              # (B, num_classes)
 
-        # Per-horizon prediction heads
-        self.horizon_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout / 2),
-                nn.Linear(hidden_dim // 2, 1),
-            )
-            for _ in range(n_horizons)
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Predict instability probability per horizon.
-
-        Args:
-            x: Combined representation (batch, input_dim).
-
-        Returns:
-            Predictions tensor (batch, n_horizons) — raw logits.
-        """
-        shared = self.shared(x)
-        predictions = torch.cat(
-            [head(shared) for head in self.horizon_heads], dim=-1
-        )  # (B, n_horizons)
-        return predictions
+        return torch.stack(horizon_logits, dim=1)         # (B, H, num_classes)
