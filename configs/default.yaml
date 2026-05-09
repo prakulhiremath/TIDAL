@@ -1,0 +1,120 @@
+# TIDAL Default Configuration
+# All experiments inherit from this base config
+
+project:
+  name: "TIDAL"
+  version: "0.1.0"
+  description: "Temporal AI for Early Detection of Latent Financial Market Instability"
+
+# ─── Reproducibility ───────────────────────────────────────────────────────────
+seed: 42
+
+# ─── Dataset ───────────────────────────────────────────────────────────────────
+data:
+  dataset: "fi2010"           # Options: fi2010, crypto_synthetic, crypto_live
+  data_dir: "data/raw"
+  processed_dir: "data/processed"
+
+  # FI-2010 specific
+  fi2010:
+    normalization: "zscore"   # Options: zscore, minmax, none
+    auction: false            # Exclude auction data
+
+  # Crypto specific
+  crypto:
+    symbol: "BTCUSDT"
+    interval: "1s"
+    n_synthetic_steps: 100000
+
+# ─── Preprocessing ─────────────────────────────────────────────────────────────
+preprocessing:
+  lob_levels: 10              # Number of LOB levels to use
+  feature_set: "full"         # Options: full, minimal, lob_only
+
+# ─── Instability Labeling ──────────────────────────────────────────────────────
+labeling:
+  horizons: [10, 30, 60]      # Prediction horizons (steps ahead)
+  
+  thresholds:
+    volatility_spike: 2.0     # Std deviations above rolling mean
+    spread_widening: 1.5      # Ratio to rolling median spread
+    liquidity_stress: 0.3     # LOB depth drop fraction
+    order_imbalance: 0.7      # Imbalance ratio threshold
+  
+  smoothing_window: 5         # Label smoothing window
+  min_instability_duration: 3 # Min consecutive steps to be instability
+
+# ─── Sequence ──────────────────────────────────────────────────────────────────
+sequence:
+  window_size: 50             # Input sequence length
+  stride: 1                   # Sliding window stride
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# ─── Training ──────────────────────────────────────────────────────────────────
+training:
+  batch_size: 256
+  max_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  optimizer: "adam"           # Options: adam, adamw, sgd
+  scheduler: "cosine"         # Options: cosine, step, none
+  gradient_clip: 1.0
+  early_stopping_patience: 15
+  num_workers: 4
+  pin_memory: true
+
+# ─── TIDAL Model ───────────────────────────────────────────────────────────────
+model:
+  name: "tidal"
+  input_dim: 40               # Feature dimension (set automatically)
+  
+  temporal_encoder:
+    cnn_channels: [64, 128]
+    cnn_kernel_size: 3
+    rnn_hidden: 128
+    rnn_layers: 2
+    rnn_dropout: 0.2
+    bidirectional: true
+  
+  regime_module:
+    n_regimes: 3              # Stable, Transitional, Unstable
+    regime_dim: 64
+    use_attention: true
+    attention_heads: 4
+  
+  instability_head:
+    hidden_dim: 64
+    dropout: 0.3
+    n_horizons: 3             # Must match labeling.horizons length
+
+# ─── Loss ──────────────────────────────────────────────────────────────────────
+loss:
+  name: "focal"               # Options: bce, focal, weighted_bce
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  class_weight_strategy: "auto"  # Auto-compute from label distribution
+
+# ─── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  primary_metric: "auroc"
+  horizons: [10, 30, 60]
+  early_warning_threshold: 0.5
+  false_alarm_rate_target: 0.1
+
+# ─── Logging & Saving ──────────────────────────────────────────────────────────
+logging:
+  log_dir: "logs"
+  results_dir: "results"
+  checkpoint_dir: "results/checkpoints"
+  save_best_only: true
+  log_every_n_steps: 50
+  tensorboard: true
+
+# ─── Visualization ─────────────────────────────────────────────────────────────
+visualization:
+  plot_dir: "results/plots"
+  dpi: 300
+  format: "pdf"               # Options: pdf, png, svg
+  style: "paper"              # Options: paper, presentation
