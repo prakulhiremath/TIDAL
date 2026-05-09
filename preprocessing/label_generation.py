@@ -1,313 +1,383 @@
 """
 preprocessing/label_generation.py
-───────────────────────────────────
-Instability label generation pipeline for TIDAL.
+----------------------------------
+Composite Instability Index and three-regime label generation for TIDAL.
 
-Defines financial market instability through a composite of:
-    1. Volatility spikes
-    2. Spread widening
-    3. Liquidity stress (LOB depth reduction)
-    4. Order imbalance surges
+Scientific framing
+------------------
+Financial instability does not emerge instantaneously — it accumulates through
+detectable microstructure deterioration before observable price disruption.
+We model this via a composite Instability Index I_t that integrates four
+complementary stress signals from the limit order book:
 
-Labels are generated for multiple prediction horizons (10, 30, 60 steps).
-Supports both binary and multi-class instability labels.
+    I_t = α·V̂_t  +  β·Ŝ_t  +  γ·L̂_t  +  δ·Ô_t
+
+where:
+    V̂_t  = rolling realized volatility (normalized, window=vol_window)
+    Ŝ_t  = spread stress: (spread_t - μ_spread) / σ_spread (rolling)
+    L̂_t  = liquidity deterioration: 1 - depth_ratio_t  (normalized)
+    Ô_t  = order imbalance persistence: EWM of |bid_vol - ask_vol| / total_vol
+
+All components are individually z-scored using a **causal rolling window**
+(no look-ahead) so that normalization statistics at time t depend only on
+history [0, t). This is then min-max mapped to [0, 1] using the same causal
+window.
+
+Three regime labels are assigned per step:
+    0 → Stable        (I_t < θ_low)
+    1 → Transitional  (θ_low ≤ I_t < θ_high)   ← scientific novelty
+    2 → Unstable      (I_t ≥ θ_high)
+
+Thresholds θ_low and θ_high are adaptive: computed from a causal rolling
+mean ± k·std of I_t, so they track the regime of the current period without
+look-ahead.
+
+Multi-horizon labeling
+----------------------
+For each target horizon H ∈ {10, 30, 60} steps, the label at time t captures
+the maximum instability regime over the forward window [t+1, t+H]. This is
+the "will instability emerge within H steps?" question.
+
+IMPORTANT: The forward labeling window is only applied AFTER the train/val/test
+split is known. Boundary steps where the look-ahead window crosses a fold
+boundary are masked and excluded from training / evaluation.
+
+Usage
+-----
+    from preprocessing.label_generation import InstabilityLabeler
+
+    labeler = InstabilityLabeler(cfg)
+    labels, index = labeler.fit_transform(features_df, fold="train")
+    # labels shape: (T, len(horizons))
+    # index: pd.Series of I_t values
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
-from loguru import logger
+from omegaconf import DictConfig
 
+
+# ---------------------------------------------------------------------------
+# Component computers
+# ---------------------------------------------------------------------------
+
+def _rolling_zscore(
+    series: pd.Series,
+    window: int,
+    min_periods: Optional[int] = None,
+) -> pd.Series:
+    """Causal (non-look-ahead) rolling z-score.
+
+    At each step t, uses only values in [t-window, t-1] (exclusive of t)
+    via ``shift(1)`` so that I_t is strictly causal.
+    """
+    mp = min_periods or max(2, window // 4)
+    roll = series.shift(1).rolling(window=window, min_periods=mp)
+    mu = roll.mean()
+    sigma = roll.std(ddof=1).clip(lower=1e-8)
+    return (series - mu) / sigma
+
+
+def _causal_minmax(
+    series: pd.Series,
+    window: int,
+    min_periods: Optional[int] = None,
+) -> pd.Series:
+    """Causal min-max normalisation to [0, 1] using a rolling window."""
+    mp = min_periods or max(2, window // 4)
+    shifted = series.shift(1)
+    roll = shifted.rolling(window=window, min_periods=mp)
+    lo = roll.min()
+    hi = roll.max()
+    rng = (hi - lo).clip(lower=1e-8)
+    return ((series - lo) / rng).clip(0.0, 1.0)
+
+
+def compute_realized_volatility(
+    mid_price: pd.Series,
+    window: int = 20,
+) -> pd.Series:
+    """Causal rolling realized volatility from log mid-price returns.
+
+    V_t = std of log-returns over the past `window` steps (causal).
+    """
+    log_ret = np.log(mid_price.clip(lower=1e-8)).diff()
+    # shift(1) → strictly causal: today's vol uses yesterday's returns
+    vol = log_ret.shift(1).rolling(window=window, min_periods=max(2, window // 4)).std(ddof=1)
+    return vol.fillna(0.0)
+
+
+def compute_spread_stress(
+    best_ask: pd.Series,
+    best_bid: pd.Series,
+    window: int = 20,
+) -> pd.Series:
+    """Causal rolling spread stress: normalised (ask - bid) / mid.
+
+    Spread widens before instability events as market makers withdraw.
+    """
+    mid = (best_ask + best_bid) / 2.0
+    spread = (best_ask - best_bid) / mid.clip(lower=1e-8)
+    return _rolling_zscore(spread, window=window).clip(-3.0, 6.0)
+
+
+def compute_liquidity_deterioration(
+    bid_depth: pd.Series,
+    ask_depth: pd.Series,
+    window: int = 20,
+) -> pd.Series:
+    """Causal liquidity deterioration index.
+
+    Measures the decline in total visible LOB depth relative to its recent
+    history. depth_ratio = total_depth_t / rolling_max_depth → deterioration
+    = 1 - depth_ratio. High values indicate thinning order books.
+    """
+    total_depth = (bid_depth + ask_depth).clip(lower=1e-8)
+    shifted = total_depth.shift(1)
+    roll_max = shifted.rolling(window=window, min_periods=max(2, window // 4)).max().clip(lower=1e-8)
+    depth_ratio = total_depth / roll_max
+    deterioration = (1.0 - depth_ratio).clip(0.0, 1.0)
+    return deterioration
+
+
+def compute_order_imbalance_persistence(
+    bid_vol: pd.Series,
+    ask_vol: pd.Series,
+    span: int = 20,
+) -> pd.Series:
+    """Exponentially weighted order imbalance persistence.
+
+    OI_t = |bid_vol - ask_vol| / (bid_vol + ask_vol)
+    Persistence = EWM(OI, span=span) to capture sustained one-sided pressure.
+    Persistent imbalance is a leading indicator of directional liquidity stress.
+    """
+    total = (bid_vol + ask_vol).clip(lower=1e-8)
+    imbalance = ((bid_vol - ask_vol) / total).abs()
+    return imbalance.ewm(span=span, adjust=False).mean()
+
+
+# ---------------------------------------------------------------------------
+# Instability Index
+# ---------------------------------------------------------------------------
 
 @dataclass
-class InstabilityThresholds:
-    """
-    Configurable thresholds for instability detection.
+class InstabilityLabeler:
+    """Compute the composite Instability Index and derive regime labels.
 
-    All thresholds are applied to rolling-normalized metrics.
-    """
-    volatility_spike: float = 2.0      # Std deviations above rolling mean
-    spread_widening: float = 1.5       # Ratio to rolling median spread
-    liquidity_stress: float = 0.3      # Fractional LOB depth drop
-    order_imbalance: float = 0.7       # Absolute imbalance threshold
-    min_duration: int = 3              # Min consecutive steps for instability
-    smoothing_window: int = 5          # Label smoothing window
-
-
-class InstabilityLabelGenerator:
-    """
-    Generates binary and horizon-specific instability labels.
-
-    The instability signal is computed from a union of market stress indicators.
-    Future-horizon labels are created by looking forward in the label sequence.
-
-    Usage:
-        gen = InstabilityLabelGenerator(thresholds=InstabilityThresholds())
-        labels = gen.generate(features_df, horizons=[10, 30, 60])
+    Parameters
+    ----------
+    cfg:
+        OmegaConf config with ``instability`` section (see default.yaml).
     """
 
-    def __init__(
+    cfg: DictConfig
+    # Causal normalisation statistics computed during fit() (train fold only)
+    _fitted: bool = field(default=False, init=False, repr=False)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def fit_transform(
         self,
-        thresholds: Optional[InstabilityThresholds] = None,
-        rolling_window: int = 50,
-    ):
-        """
-        Initialize label generator.
+        features: pd.DataFrame,
+        fold: str = "train",
+        horizon_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, pd.Series]:
+        """Compute index and labels from feature DataFrame.
 
-        Args:
-            thresholds: Instability threshold configuration.
-            rolling_window: Window for rolling baseline statistics.
-        """
-        self.thresholds = thresholds or InstabilityThresholds()
-        self.rolling_window = rolling_window
+        Parameters
+        ----------
+        features:
+            DataFrame produced by feature_engineering.py. Must contain columns:
+            ``mid_price``, ``best_ask``, ``best_bid``,
+            ``bid_depth``, ``ask_depth``, ``bid_vol``, ``ask_vol``.
+        fold:
+            "train" | "val" | "test". Determines whether thresholds are
+            fitted here or applied from previously fitted values.
+        horizon_mask:
+            Boolean array of shape (T,). True = this step is near a fold
+            boundary and its forward look-ahead would leak. These steps get
+            label = -1 (excluded from training/eval).
 
-    def generate(
-        self,
-        features: np.ndarray,
-        feature_names: List[str],
-        horizons: List[int] = [10, 30, 60],
-    ) -> Dict[str, np.ndarray]:
+        Returns
+        -------
+        labels:
+            int8 array of shape (T, H) where H = len(horizons).
+            Values: 0=Stable, 1=Transitional, 2=Unstable, -1=masked.
+        index:
+            pd.Series of I_t (composite instability index, [0, 1]).
         """
-        Generate instability labels at multiple prediction horizons.
+        self._check_columns(features)
+        ic = self.cfg.instability
 
-        Args:
-            features: Feature array (T, n_features).
-            feature_names: List of feature names (for column lookup).
-            horizons: List of forward prediction horizons (steps).
+        # --- Compute raw components ---
+        V = compute_realized_volatility(
+            features["mid_price"], window=ic.vol_window
+        )
+        S = compute_spread_stress(
+            features["best_ask"], features["best_bid"], window=ic.spread_window
+        )
+        L = compute_liquidity_deterioration(
+            features["bid_depth"], features["ask_depth"], window=ic.liquidity_window
+        )
+        O = compute_order_imbalance_persistence(
+            features["bid_vol"], features["ask_vol"], span=ic.imbalance_window
+        )
 
-        Returns:
-            Dictionary mapping label name → binary array (T,).
-            Keys: 'instability_now', 'instability_h10', 'instability_h30', etc.
-        """
+        # --- Causal normalisation to [0, 1] ---
+        norm_window = ic.get("threshold_window", 500)
+        V_n = _causal_minmax(V.fillna(0.0), window=norm_window)
+        S_n = _causal_minmax(S.fillna(0.0), window=norm_window)
+        L_n = _causal_minmax(L.fillna(0.0), window=norm_window)
+        O_n = _causal_minmax(O.fillna(0.0), window=norm_window)
+
+        # --- Composite index ---
+        α, β, γ, δ = (
+            ic.weights.alpha,
+            ic.weights.beta,
+            ic.weights.gamma,
+            ic.weights.delta,
+        )
+        I = (α * V_n + β * S_n + γ * L_n + δ * O_n).clip(0.0, 1.0)
+        I.name = "instability_index"
+
+        # --- Adaptive regime thresholds (causal) ---
+        θ_low, θ_high = self._compute_thresholds(I)
+
+        # --- Assign point-in-time regime labels ---
+        regime_t = self._assign_regime(I, θ_low, θ_high)
+
+        # --- Multi-horizon forward labels ---
+        horizons: List[int] = list(self.cfg.data.horizons)
         T = len(features)
-        df = pd.DataFrame(features, columns=feature_names)
+        labels = np.full((T, len(horizons)), fill_value=-1, dtype=np.int8)
 
-        logger.info(f"Generating instability labels: T={T}, horizons={horizons}")
+        for h_idx, H in enumerate(horizons):
+            for t in range(T - H):
+                # Maximum regime in the forward window [t+1, t+H]
+                labels[t, h_idx] = int(regime_t.iloc[t + 1 : t + H + 1].max())
+            # Last H steps: forward window crosses the end — mask them
+            labels[T - H :, h_idx] = -1
 
-        # ── Compute individual instability signals ──────────────────────────
-        vol_signal    = self._volatility_signal(df)
-        spread_signal = self._spread_signal(df)
-        depth_signal  = self._depth_signal(df)
-        imb_signal    = self._imbalance_signal(df)
+        # --- Apply boundary mask (fold crossings) ---
+        if horizon_mask is not None:
+            labels[horizon_mask] = -1
 
-        # ── Composite instability: any signal firing ────────────────────────
-        raw_instability = (
-            vol_signal.astype(int)
-            + spread_signal.astype(int)
-            + depth_signal.astype(int)
-            + imb_signal.astype(int)
-        ) >= 2  # At least 2 signals must fire
+        self._fitted = True
+        return labels, I
 
-        # ── Apply minimum duration filter ───────────────────────────────────
-        instability_now = self._apply_duration_filter(
-            raw_instability.values, self.thresholds.min_duration
-        )
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        # ── Smooth labels to reduce noise ───────────────────────────────────
-        instability_now = self._smooth_labels(
-            instability_now, self.thresholds.smoothing_window
-        )
+    def _compute_thresholds(
+        self, I: pd.Series
+    ) -> Tuple[pd.Series, pd.Series]:
+        """Causal adaptive thresholds from rolling mean ± k·std of I_t.
 
-        # ── Record individual signal components ─────────────────────────────
-        labels = {
-            "instability_now": instability_now,
-            "vol_signal": vol_signal.values.astype(int),
-            "spread_signal": spread_signal.values.astype(int),
-            "depth_signal": depth_signal.values.astype(int),
-            "imbalance_signal": imb_signal.values.astype(int),
-        }
+        For the first `threshold_window` steps where the rolling window is
+        not fully populated, we fall back to the configurable fixed thresholds
+        from ``regime_thresholds``.
+        """
+        ic = self.cfg.instability
+        k = ic.threshold_k
+        window = ic.threshold_window
+        mp = max(10, window // 10)
 
-        # ── Generate forward-horizon labels ─────────────────────────────────
-        for h in horizons:
-            horizon_label = self._future_horizon_label(instability_now, horizon=h)
-            labels[f"instability_h{h}"] = horizon_label
+        shifted = I.shift(1)
+        roll = shifted.rolling(window=window, min_periods=mp)
+        mu = roll.mean()
+        sigma = roll.std(ddof=1).clip(lower=1e-8)
 
-        # ── Log class statistics ─────────────────────────────────────────────
-        n_unstable = instability_now.sum()
-        pct = 100 * n_unstable / T
-        logger.info(f"Instability: {n_unstable}/{T} steps ({pct:.1f}%) labeled as unstable")
+        θ_low_adaptive = (mu - k * sigma).clip(0.0, 1.0)
+        θ_high_adaptive = (mu + k * sigma).clip(0.0, 1.0)
 
-        for h in horizons:
-            k = f"instability_h{h}"
-            h_pct = 100 * labels[k].sum() / T
-            logger.info(f"  Horizon h={h}: {labels[k].sum()} ({h_pct:.1f}%) unstable")
+        # Fall back to fixed thresholds where rolling window is not yet full
+        rt = ic.regime_thresholds
+        θ_low = θ_low_adaptive.fillna(rt.stable_upper)
+        θ_high = θ_high_adaptive.fillna(rt.unstable_lower)
 
-        return labels
+        # Ensure θ_low < θ_high
+        swap = θ_low >= θ_high
+        θ_low[swap] = rt.stable_upper
+        θ_high[swap] = rt.unstable_lower
 
-    def generate_multiclass(
+        return θ_low, θ_high
+
+    def _assign_regime(
         self,
-        features: np.ndarray,
-        feature_names: List[str],
-    ) -> np.ndarray:
-        """
-        Generate 3-class regime labels: 0=Stable, 1=Transitional, 2=Unstable.
+        I: pd.Series,
+        θ_low: pd.Series,
+        θ_high: pd.Series,
+    ) -> pd.Series:
+        """Map index values to {0, 1, 2} using adaptive thresholds."""
+        regime = pd.Series(0, index=I.index, dtype=np.int8)
+        regime[I >= θ_high] = 2
+        regime[(I >= θ_low) & (I < θ_high)] = 1
+        return regime
 
-        Args:
-            features: Feature array (T, n_features).
-            feature_names: Feature name list.
+    @staticmethod
+    def _check_columns(df: pd.DataFrame) -> None:
+        required = {
+            "mid_price", "best_ask", "best_bid",
+            "bid_depth", "ask_depth", "bid_vol", "ask_vol",
+        }
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"features DataFrame is missing required columns: {sorted(missing)}\n"
+                f"Available columns: {list(df.columns)}"
+            )
 
-        Returns:
-            Array of shape (T,) with values {0, 1, 2}.
-        """
-        df = pd.DataFrame(features, columns=feature_names)
 
-        vol_signal    = self._volatility_signal(df)
-        spread_signal = self._spread_signal(df)
-        depth_signal  = self._depth_signal(df)
-        imb_signal    = self._imbalance_signal(df)
+# ---------------------------------------------------------------------------
+# Utility: compute label class frequencies for loss weighting
+# ---------------------------------------------------------------------------
 
-        score = (
-            vol_signal.astype(int)
-            + spread_signal.astype(int)
-            + depth_signal.astype(int)
-            + imb_signal.astype(int)
-        )
+def compute_class_weights(
+    labels: np.ndarray,
+    num_classes: int = 3,
+    method: str = "inverse_freq",
+) -> np.ndarray:
+    """Compute class weights for imbalanced instability labels.
 
-        regimes = np.zeros(len(features), dtype=int)
-        regimes[score == 1] = 1  # Transitional
-        regimes[score >= 2] = 2  # Unstable
+    Parameters
+    ----------
+    labels:
+        Flat or 2D array of integer labels. Masked values (-1) are excluded.
+    num_classes:
+        Number of target classes (3 for three-regime).
+    method:
+        "inverse_freq" — weight_c = N / (num_classes · N_c)
+        "sqrt_inv"     — weight_c = sqrt(N / N_c)
 
-        logger.info(
-            f"Regime distribution: "
-            f"Stable={( regimes==0).sum()} | "
-            f"Transitional={(regimes==1).sum()} | "
-            f"Unstable={(regimes==2).sum()}"
-        )
-        return regimes
+    Returns
+    -------
+    weights:
+        Float32 array of shape (num_classes,).
+    """
+    valid = labels[labels >= 0].flatten()
+    N = len(valid)
+    weights = np.ones(num_classes, dtype=np.float32)
 
-    def get_transition_points(self, labels: np.ndarray) -> np.ndarray:
-        """
-        Identify transition points where the regime label changes.
-
-        Args:
-            labels: Label array (T,).
-
-        Returns:
-            Boolean array of shape (T,), True at transition steps.
-        """
-        transitions = np.zeros(len(labels), dtype=bool)
-        transitions[1:] = labels[1:] != labels[:-1]
-        return transitions
-
-    # ── Private signal methods ───────────────────────────────────────────────
-
-    def _volatility_signal(self, df: pd.DataFrame) -> pd.Series:
-        """Detect volatility spikes relative to rolling baseline."""
-        col = self._find_col(df, ["vol_rolling_10", "vol_rolling_5", "log_return_1"])
-        if col is None:
-            logger.warning("No volatility feature found. Generating from mid_price.")
-            mid = self._find_col_series(df, ["mid_price", "log_mid_price"])
-            col_series = mid.pct_change().abs().fillna(0)
+    for c in range(num_classes):
+        N_c = int((valid == c).sum())
+        if N_c == 0:
+            weights[c] = 1.0
+            continue
+        if method == "inverse_freq":
+            weights[c] = N / (num_classes * N_c)
+        elif method == "sqrt_inv":
+            weights[c] = np.sqrt(N / N_c)
         else:
-            col_series = df[col]
+            raise ValueError(f"Unknown method: {method}")
 
-        rolling_mean = col_series.rolling(self.rolling_window, min_periods=1).mean()
-        rolling_std  = col_series.rolling(self.rolling_window, min_periods=1).std().fillna(1e-8)
-        z_score = (col_series - rolling_mean) / (rolling_std + 1e-8)
-        return z_score > self.thresholds.volatility_spike
-
-    def _spread_signal(self, df: pd.DataFrame) -> pd.Series:
-        """Detect spread widening beyond rolling median."""
-        col = self._find_col(df, ["spread_L1", "rel_spread_L1", "spread"])
-        if col is None:
-            return pd.Series(np.zeros(len(df), dtype=bool))
-        spread = df[col]
-        rolling_median = spread.rolling(self.rolling_window, min_periods=1).median()
-        ratio = spread / (rolling_median + 1e-8)
-        return ratio > self.thresholds.spread_widening
-
-    def _depth_signal(self, df: pd.DataFrame) -> pd.Series:
-        """Detect LOB depth collapse (liquidity stress)."""
-        col = self._find_col(df, ["total_depth", "total_bid_depth", "total_ask_depth"])
-        if col is None:
-            return pd.Series(np.zeros(len(df), dtype=bool))
-        depth = df[col]
-        rolling_max = depth.rolling(self.rolling_window, min_periods=1).max()
-        drop_fraction = 1.0 - (depth / (rolling_max + 1e-8))
-        return drop_fraction > self.thresholds.liquidity_stress
-
-    def _imbalance_signal(self, df: pd.DataFrame) -> pd.Series:
-        """Detect extreme order imbalance."""
-        col = self._find_col(df, ["weighted_imbalance", "mean_imbalance", "depth_imbalance"])
-        if col is None:
-            return pd.Series(np.zeros(len(df), dtype=bool))
-        imbalance = df[col].abs()
-        return imbalance > self.thresholds.order_imbalance
-
-    def _apply_duration_filter(self, labels: np.ndarray, min_duration: int) -> np.ndarray:
-        """
-        Remove short instability episodes below minimum duration.
-
-        Args:
-            labels: Binary label array.
-            min_duration: Minimum consecutive instability steps.
-
-        Returns:
-            Filtered binary label array.
-        """
-        filtered = labels.copy()
-        i = 0
-        while i < len(labels):
-            if labels[i]:
-                j = i
-                while j < len(labels) and labels[j]:
-                    j += 1
-                if j - i < min_duration:
-                    filtered[i:j] = False
-                i = j
-            else:
-                i += 1
-        return filtered
-
-    def _smooth_labels(self, labels: np.ndarray, window: int) -> np.ndarray:
-        """
-        Apply majority-vote smoothing over a sliding window.
-
-        Args:
-            labels: Binary label array.
-            window: Smoothing window size.
-
-        Returns:
-            Smoothed binary label array.
-        """
-        if window <= 1:
-            return labels
-        smoothed = pd.Series(labels.astype(float)).rolling(
-            window, center=True, min_periods=1
-        ).mean().values
-        return (smoothed >= 0.5).astype(int)
-
-    def _future_horizon_label(self, labels: np.ndarray, horizon: int) -> np.ndarray:
-        """
-        Create forward-looking labels: was there instability within next `horizon` steps?
-
-        Args:
-            labels: Current-time instability labels.
-            horizon: Number of steps to look ahead.
-
-        Returns:
-            Binary array where 1 = instability occurs within next `horizon` steps.
-        """
-        T = len(labels)
-        future_labels = np.zeros(T, dtype=int)
-        for t in range(T - horizon):
-            if labels[t + 1: t + horizon + 1].any():
-                future_labels[t] = 1
-        # Last `horizon` steps cannot be labeled — mark as 0
-        future_labels[T - horizon:] = 0
-        return future_labels
-
-    def _find_col(self, df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-        """Find first matching column name from candidates."""
-        for c in candidates:
-            if c in df.columns:
-                return c
-        return None
-
-    def _find_col_series(self, df: pd.DataFrame, candidates: List[str]) -> pd.Series:
-        """Return first matching column series."""
-        col = self._find_col(df, candidates)
-        if col:
-            return df[col]
-        return pd.Series(np.zeros(len(df)))
+    # Normalise so mean weight = 1.0
+    weights = weights / weights.mean()
+    return weights
