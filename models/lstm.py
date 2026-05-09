@@ -1,80 +1,79 @@
 """
 models/lstm.py
-───────────────
-LSTM baseline model for financial instability detection.
+--------------
+Bidirectional LSTM baseline for TIDAL benchmark comparisons.
 
-A standard bidirectional LSTM with multi-horizon output heads,
-used as a sequential deep learning baseline against TIDAL.
+This baseline serves as the recurrent reference point: it captures sequential
+dependencies but lacks explicit regime-transition modelling, structured state
+spaces, and the gated SSM+attention fusion of TIDAL.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from typing import Dict
+import torch.nn.functional as F
+from omegaconf import DictConfig
 
 
-class LSTMBaseline(nn.Module):
-    """
-    Bidirectional LSTM baseline for instability prediction.
+class LSTMModel(nn.Module):
+    """Bidirectional stacked LSTM for multi-horizon instability classification.
 
-    Architecture:
-        - Projection layer (input_dim → hidden_size)
-        - Stacked BiLSTM
-        - FC head per prediction horizon
-
-    Usage:
-        model = LSTMBaseline(input_dim=40, hidden_size=128, n_horizons=3)
-        logits = model(x)['logits']  # (B, n_horizons)
+    Parameters
+    ----------
+    cfg : OmegaConf config with ``model.lstm`` and ``model`` sections.
     """
 
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_size: int = 128,
-        num_layers: int = 2,
-        dropout: float = 0.2,
-        bidirectional: bool = True,
-        fc_hidden: int = 64,
-        n_horizons: int = 3,
-    ):
+    def __init__(self, cfg: DictConfig) -> None:
         super().__init__()
+        mc = cfg.model
+        lc = mc.lstm
 
-        self.input_proj = nn.Linear(input_dim, hidden_size)
-        dirs = 2 if bidirectional else 1
+        self.num_horizons = len(cfg.data.horizons)
+        self.num_classes  = mc.num_classes
+        self.horizons     = list(cfg.data.horizons)
+        self.bidirectional = lc.get("bidirectional", True)
+        directions = 2 if self.bidirectional else 1
+
+        self.input_proj = nn.Linear(mc.input_dim, mc.hidden_dim)
 
         self.lstm = nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
+            input_size=mc.hidden_dim,
+            hidden_size=mc.hidden_dim,
+            num_layers=mc.num_layers,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
+            dropout=mc.dropout if mc.num_layers > 1 else 0.0,
+            bidirectional=self.bidirectional,
         )
 
-        lstm_out_dim = hidden_size * dirs
+        lstm_out_dim = mc.hidden_dim * directions
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(lstm_out_dim, mc.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(mc.dropout),
+                nn.Linear(mc.hidden_dim, mc.num_classes),
+            )
+            for _ in range(self.num_horizons)
+        ])
 
         self.norm = nn.LayerNorm(lstm_out_dim)
-        self.dropout = nn.Dropout(dropout)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_out_dim, fc_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(fc_hidden, n_horizons),
-        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, F) → logits: (B, H, C)"""
+        h = self.input_proj(x)                 # (B, T, hidden)
+        out, _ = self.lstm(h)                  # (B, T, hidden*dirs)
+        last = self.norm(out[:, -1, :])        # (B, hidden*dirs)
+        logits = torch.stack([head(last) for head in self.heads], dim=1)
+        return logits                           # (B, H, C)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            x: (batch, seq_len, input_dim)
-        Returns:
-            Dict with 'logits' and 'probs'.
-        """
-        x = self.input_proj(x)
-        lstm_out, _ = self.lstm(x)
-        context = self.norm(lstm_out[:, -1, :])
-        context = self.dropout(context)
-        logits = self.classifier(context)
-        return {"logits": logits, "probs": torch.sigmoid(logits)}
+    def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return F.softmax(self.forward(x), dim=-1)
+
+    def predict_instability_score(self, x: torch.Tensor) -> torch.Tensor:
+        probs = self.predict_proba(x)
+        return probs[:, :, 1:].sum(dim=-1)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
