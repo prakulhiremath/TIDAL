@@ -1,0 +1,25 @@
+# TIDAL Transformer Baseline Configuration
+
+defaults:
+  - default
+
+model:
+  name: "transformer"
+  d_model: 128
+  nhead: 4
+  num_encoder_layers: 3
+  dim_feedforward: 256
+  dropout: 0.1
+  max_seq_len: 200
+  fc_hidden: 64
+
+training:
+  batch_size: 128
+  max_epochs: 80
+  learning_rate: 0.0005
+  scheduler: "cosine"
+  warmup_steps: 500
+
+loss:
+  name: "focal"
+  focal_gamma: 2.0
