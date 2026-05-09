@@ -1,0 +1,58 @@
+# TIDAL: Core dependencies
+# Python 3.9+
+
+# Deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Scientific computing
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+
+# Gradient boosting
+xgboost>=1.7.0
+lightgbm>=4.0.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.14.0
+
+# Experiment tracking
+tensorboard>=2.13.0
+
+# Progress & logging
+tqdm>=4.65.0
+loguru>=0.7.0
+rich>=13.0.0
+
+# Data utilities
+h5py>=3.8.0
+joblib>=1.3.0
+
+# Notebook support
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+
+# Code quality
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.3.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# HTTP / data fetching
+requests>=2.31.0
+aiohttp>=3.8.0
+
+# Optional: Mamba/S4 state space models
+# Install separately if using SSM:
+# pip install mamba-ssm  (requires CUDA)
