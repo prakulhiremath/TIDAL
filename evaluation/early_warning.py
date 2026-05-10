@@ -1,357 +1,230 @@
 """
 evaluation/early_warning.py
 ────────────────────────────
-Early-warning system evaluation for TIDAL instability surveillance.
+Early warning system evaluation for TIDAL.
 
-Evaluates the surveillance system as a *threshold-based alarm system*:
-    - At each time step, the instability score s_t = P(Trans) + P(Unstable)
-    - An alarm fires when s_t ≥ threshold θ
-    - A true positive = alarm fires within `lead_time_window` steps before onset
+This module analyzes the temporal relationship between model predictions
+and ground-truth instability events, quantifying:
 
-This framing is distinct from simple classification accuracy because it
-rewards early detection and penalises late or missed alarms.
-
-Key outputs
------------
-- Lead-time distribution (how far in advance alarms fire)
-- Precision-recall tradeoff across thresholds
-- Hit rate / miss rate / false alarm rate at the operating threshold
-- Alarm persistence analysis (sustained vs sporadic alarms)
+    - How early can TIDAL detect upcoming instability?
+    - What is the optimal detection threshold for surveillance?
+    - How does lead time vary across different instability types?
+    - What is the precision-recall trade-off for early warning?
 """
 
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from loguru import logger
+
+from evaluation.metrics import compute_binary_metrics, compute_early_warning_metrics
 
 
-# ---------------------------------------------------------------------------
-# Event detection
-# ---------------------------------------------------------------------------
-
-def detect_onset_events(
-    targets: np.ndarray,    # (N,) int labels
-    unstable_class: int = 2,
-    min_gap: int = 10,
-) -> List[int]:
-    """Find indices of instability onset events.
-
-    An onset is the first step of each new Unstable episode. Episodes
-    separated by fewer than `min_gap` stable steps are merged.
-
-    Parameters
-    ----------
-    targets:
-        Temporal sequence of ground-truth regime labels.
-    unstable_class:
-        Class index for the Unstable regime.
-    min_gap:
-        Minimum gap (in steps) between two separate episodes.
-
-    Returns
-    -------
-    List of onset time indices.
+class EarlyWarningEvaluator:
     """
-    is_unstable = (targets == unstable_class).astype(int)
-    onsets: List[int] = []
-    in_event = False
-    last_end  = -min_gap - 1
+    Evaluates TIDAL as an early warning system for financial instability.
 
-    for t in range(len(is_unstable)):
-        if is_unstable[t] == 1:
-            if not in_event:
-                if t - last_end >= min_gap:
-                    onsets.append(t)
-                in_event = True
-        else:
-            if in_event:
-                last_end = t
-            in_event = False
+    Goes beyond point-in-time classification to evaluate:
+        1. Lead time distribution
+        2. Horizon-specific performance curves
+        3. Operating point analysis
+        4. Regime transition detection timing
 
-    return onsets
-
-
-def detect_alarm_events(
-    scores: np.ndarray,    # (N,) instability scores
-    threshold: float = 0.5,
-    min_gap: int = 5,
-) -> List[int]:
-    """Find indices of alarm *onset* (first step of each alarm episode).
-
-    Parameters
-    ----------
-    scores:
-        Temporal sequence of instability scores.
-    threshold:
-        Alert threshold.
-    min_gap:
-        Merge alarm events separated by fewer than this many steps.
-
-    Returns
-    -------
-    List of alarm onset time indices.
+    Usage:
+        evaluator = EarlyWarningEvaluator(horizons=[10, 30, 60])
+        report = evaluator.evaluate(probs, regimes, episodes)
+        evaluator.save_report(report, "results/tables/early_warning.csv")
     """
-    is_alarm = (scores >= threshold).astype(int)
-    alarms: List[int] = []
-    in_alarm = False
-    last_end = -min_gap - 1
 
-    for t in range(len(is_alarm)):
-        if is_alarm[t] == 1:
-            if not in_alarm:
-                if t - last_end >= min_gap:
-                    alarms.append(t)
-                in_alarm = True
-        else:
-            if in_alarm:
-                last_end = t
-            in_alarm = False
+    def __init__(
+        self,
+        horizons: List[int] = [10, 30, 60],
+        threshold_range: Tuple[float, float, int] = (0.1, 0.9, 50),
+        neighborhood: int = 10,
+    ):
+        """
+        Args:
+            horizons: Prediction horizons to evaluate.
+            threshold_range: (min, max, n_steps) for threshold sweep.
+            neighborhood: Steps around transitions for sensitivity analysis.
+        """
+        self.horizons = horizons
+        self.threshold_range = threshold_range
+        self.neighborhood = neighborhood
 
-    return alarms
+    def evaluate(
+        self,
+        probs_per_horizon: Dict[str, np.ndarray],
+        y_true_per_horizon: Dict[str, np.ndarray],
+        regimes: np.ndarray,
+        instability_episodes: Optional[List[Dict]] = None,
+    ) -> Dict:
+        """
+        Full early warning evaluation across all horizons.
 
+        Args:
+            probs_per_horizon: Dict mapping 'h10', 'h30', 'h60' → prob array (T,).
+            y_true_per_horizon: Dict mapping same keys → binary label array (T,).
+            regimes: Regime labels {0,1,2} of shape (T,).
+            instability_episodes: List of episode dicts (from InstabilityIndex).
 
-# ---------------------------------------------------------------------------
-# Lead-time analysis
-# ---------------------------------------------------------------------------
-
-def lead_time_analysis(
-    scores: np.ndarray,
-    targets: np.ndarray,
-    threshold: float = 0.5,
-    lead_time_window: int = 60,
-    unstable_class: int = 2,
-    min_gap: int = 10,
-) -> Dict:
-    """Full lead-time analysis for a single horizon.
-
-    Parameters
-    ----------
-    scores:
-        (N,) instability score sequence.
-    targets:
-        (N,) ground-truth label sequence.
-    threshold:
-        Alert threshold.
-    lead_time_window:
-        Maximum steps before onset to credit as early warning.
-    unstable_class:
-        Unstable class index.
-    min_gap:
-        Minimum episode separation (steps).
-
-    Returns
-    -------
-    Dict with detailed lead-time statistics.
-    """
-    onsets = detect_onset_events(targets, unstable_class, min_gap)
-    if not onsets:
-        return {
-            "n_events": 0,
-            "detected": 0,
-            "missed": 0,
-            "detection_rate": float("nan"),
-            "lead_times": [],
-            "mean_lead_time": float("nan"),
-            "median_lead_time": float("nan"),
-            "std_lead_time": float("nan"),
-            "lead_time_hist": [],
+        Returns:
+            Comprehensive evaluation report dictionary.
+        """
+        report = {
+            "per_horizon": {},
+            "threshold_sweep": {},
+            "early_warning": {},
+            "transition_sensitivity": {},
         }
 
-    lead_times = []
-    missed     = 0
+        for key, probs in probs_per_horizon.items():
+            h = int(key.replace("h", ""))
+            y_true_key = f"instability_h{h}" if f"instability_h{h}" in y_true_per_horizon else key
+            y_true = y_true_per_horizon.get(y_true_key, y_true_per_horizon.get(key))
 
-    for onset in onsets:
-        window_start = max(0, onset - lead_time_window)
-        window_scores = scores[window_start:onset]
-        alarm_steps = np.where(window_scores >= threshold)[0]
+            if y_true is None:
+                continue
 
-        if len(alarm_steps) > 0:
-            first_alarm = alarm_steps[0]
-            lead_t = len(window_scores) - first_alarm
-            lead_times.append(int(lead_t))
-        else:
-            missed += 1
+            # Standard metrics
+            base_metrics = compute_binary_metrics(y_true, probs, threshold=0.5)
+            report["per_horizon"][f"h{h}"] = base_metrics
 
-    detected = len(onsets) - missed
-    detection_rate = detected / len(onsets)
+            # Threshold sweep
+            report["threshold_sweep"][f"h{h}"] = self._threshold_sweep(y_true, probs)
 
-    lead_arr = np.array(lead_times) if lead_times else np.array([0])
+            # Early warning metrics
+            if instability_episodes:
+                ew_metrics = compute_early_warning_metrics(
+                    y_true, probs, instability_episodes, threshold=0.5
+                )
+                report["early_warning"][f"h{h}"] = ew_metrics
 
-    # Histogram bins for distribution
-    bins = np.arange(0, lead_time_window + 10, 5)
-    hist, _ = np.histogram(lead_arr, bins=bins)
+        # Transition sensitivity (use shortest horizon as proxy)
+        if "h10" in probs_per_horizon:
+            probs_h10 = probs_per_horizon["h10"]
+            y_true_h10 = y_true_per_horizon.get("instability_h10", y_true_per_horizon.get("h10"))
+            if y_true_h10 is not None:
+                from evaluation.metrics import compute_transition_sensitivity
+                report["transition_sensitivity"] = compute_transition_sensitivity(
+                    y_true_h10, probs_h10, regimes,
+                    threshold=0.5, neighborhood=self.neighborhood
+                )
 
-    return {
-        "n_events":       len(onsets),
-        "detected":       detected,
-        "missed":         missed,
-        "detection_rate": float(detection_rate),
-        "lead_times":     lead_times,
-        "mean_lead_time":   float(np.mean(lead_arr)) if lead_times else 0.0,
-        "median_lead_time": float(np.median(lead_arr)) if lead_times else 0.0,
-        "std_lead_time":    float(np.std(lead_arr)) if lead_times else 0.0,
-        "lead_time_hist": hist.tolist(),
-        "lead_time_bins": bins.tolist(),
-    }
+        # Summary statistics
+        report["summary"] = self._compute_summary(report)
 
+        logger.info("Early warning evaluation complete")
+        logger.info(f"  Lead time (h10): {report['early_warning'].get('h10', {}).get('lead_time_mean', 0):.1f} steps")
+        logger.info(f"  Detection rate: {report['early_warning'].get('h10', {}).get('detection_rate', 0):.3f}")
+        logger.info(f"  Transition sensitivity: {report['transition_sensitivity'].get('transition_auroc', 0):.4f}")
 
-# ---------------------------------------------------------------------------
-# Precision-recall at various thresholds
-# ---------------------------------------------------------------------------
+        return report
 
-def alarm_precision_recall_curve(
-    scores: np.ndarray,
-    targets: np.ndarray,
-    thresholds: Optional[np.ndarray] = None,
-    lead_time_window: int = 60,
-    unstable_class: int = 2,
-    min_gap: int = 10,
-) -> Dict:
-    """Event-level precision-recall curve across alarm thresholds.
+    def _threshold_sweep(
+        self,
+        y_true: np.ndarray,
+        y_prob: np.ndarray,
+    ) -> List[Dict[str, float]]:
+        """
+        Compute metrics across a range of thresholds for ROC analysis.
 
-    Unlike sample-level AUPRC, this evaluates *alarm events*:
-        - Precision = detected_events / alarm_events
-        - Recall    = detected_events / total_onset_events
+        Args:
+            y_true: Binary labels (T,).
+            y_prob: Predicted probabilities (T,).
 
-    Parameters
-    ----------
-    scores:
-        (N,) instability score sequence.
-    targets:
-        (N,) label sequence.
-    thresholds:
-        Array of threshold values to sweep. Defaults to 20 values in [0.1, 0.9].
-    lead_time_window, unstable_class, min_gap:
-        Passed to detect_onset_events / detect_alarm_events.
+        Returns:
+            List of metric dicts, one per threshold.
+        """
+        min_t, max_t, n_steps = self.threshold_range
+        thresholds = np.linspace(min_t, max_t, n_steps)
+        results = []
 
-    Returns
-    -------
-    Dict with ``precision``, ``recall``, ``thresholds``, ``f1`` arrays.
-    """
-    if thresholds is None:
-        thresholds = np.linspace(0.1, 0.9, 20)
+        for thresh in thresholds:
+            y_pred = (y_prob >= thresh).astype(int)
+            from sklearn.metrics import precision_score, recall_score, f1_score
+            tn = int(((y_pred == 0) & (y_true == 0)).sum())
+            fp = int(((y_pred == 1) & (y_true == 0)).sum())
+            tp = int(((y_pred == 1) & (y_true == 1)).sum())
+            fn = int(((y_pred == 0) & (y_true == 1)).sum())
 
-    onsets  = detect_onset_events(targets, unstable_class, min_gap)
-    n_onset = len(onsets)
+            results.append({
+                "threshold": float(thresh),
+                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+                "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+                "false_alarm_rate": float(fp / max(tn + fp, 1)),
+                "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            })
 
-    precisions, recalls, f1s = [], [], []
+        return results
 
-    for θ in thresholds:
-        alarms  = detect_alarm_events(scores, θ, min_gap)
-        n_alarm = len(alarms)
+    def _compute_summary(self, report: Dict) -> Dict[str, float]:
+        """Extract key summary statistics from the full report."""
+        summary = {}
 
-        if n_alarm == 0:
-            precisions.append(1.0)
-            recalls.append(0.0)
-            f1s.append(0.0)
-            continue
+        # Best AUROC across horizons
+        aurocs = [
+            report["per_horizon"].get(f"h{h}", {}).get("auroc", 0)
+            for h in self.horizons
+        ]
+        summary["best_auroc"] = float(max(aurocs)) if aurocs else 0.0
+        summary["mean_auroc"] = float(np.mean(aurocs)) if aurocs else 0.0
 
-        # Match: each alarm event credited if within lead_time_window before an onset
-        matched_onsets = set()
-        tp = 0
-        for alarm_t in alarms:
-            for onset_t in onsets:
-                if 0 < (onset_t - alarm_t) <= lead_time_window:
-                    if onset_t not in matched_onsets:
-                        tp += 1
-                        matched_onsets.add(onset_t)
-                        break
+        # Early warning lead time
+        ew_h10 = report["early_warning"].get("h10", {})
+        summary["lead_time_mean"] = float(ew_h10.get("lead_time_mean", 0))
+        summary["detection_rate"] = float(ew_h10.get("detection_rate", 0))
+        summary["false_alarm_rate"] = float(ew_h10.get("false_alarm_rate_stable", 0))
 
-        precision = tp / n_alarm if n_alarm > 0 else 0.0
-        recall    = tp / n_onset if n_onset > 0 else 0.0
-        f1        = (2 * precision * recall / (precision + recall + 1e-8))
+        # Transition sensitivity
+        trans = report.get("transition_sensitivity", {})
+        summary["transition_auroc"] = float(trans.get("transition_auroc", 0))
+        summary["transitional_detection_rate"] = float(trans.get("transitional_detection_rate", 0))
 
-        precisions.append(precision)
-        recalls.append(recall)
-        f1s.append(f1)
+        return summary
 
-    return {
-        "thresholds": thresholds.tolist(),
-        "precision":  precisions,
-        "recall":     recalls,
-        "f1":         f1s,
-        "n_onsets":   n_onset,
-    }
+    def save_report(self, report: Dict, output_dir: str) -> None:
+        """
+        Save evaluation report as CSV and JSON files.
 
+        Args:
+            report: Report dictionary from evaluate().
+            output_dir: Directory to save outputs.
+        """
+        import json
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Alarm persistence analysis
-# ---------------------------------------------------------------------------
+        # Per-horizon metrics CSV
+        horizon_rows = []
+        for h_key, metrics in report["per_horizon"].items():
+            row = {"horizon": h_key, **metrics}
+            horizon_rows.append(row)
+        if horizon_rows:
+            pd.DataFrame(horizon_rows).to_csv(
+                output_path / "per_horizon_metrics.csv", index=False
+            )
 
-def alarm_persistence_analysis(
-    scores: np.ndarray,
-    targets: np.ndarray,
-    threshold: float = 0.5,
-    unstable_class: int = 2,
-) -> Dict:
-    """Analyse the temporal structure of alarm episodes.
+        # Early warning CSV
+        ew_rows = []
+        for h_key, ew in report["early_warning"].items():
+            row = {"horizon": h_key, **ew}
+            ew_rows.append(row)
+        if ew_rows:
+            pd.DataFrame(ew_rows).to_csv(
+                output_path / "early_warning_metrics.csv", index=False
+            )
 
-    Returns statistics on alarm episode durations and whether they
-    tend to cluster before genuine instability events.
-    """
-    is_alarm    = scores >= threshold
-    is_unstable = targets == unstable_class
+        # Summary JSON
+        with open(output_path / "summary.json", "w") as f:
+            json.dump(report.get("summary", {}), f, indent=2)
 
-    # Episode durations
-    durations = []
-    current   = 0
-    for a in is_alarm:
-        if a:
-            current += 1
-        else:
-            if current > 0:
-                durations.append(current)
-            current = 0
-    if current > 0:
-        durations.append(current)
+        # Transition sensitivity CSV
+        if report.get("transition_sensitivity"):
+            pd.DataFrame([report["transition_sensitivity"]]).to_csv(
+                output_path / "transition_sensitivity.csv", index=False
+            )
 
-    dur_arr = np.array(durations) if durations else np.array([0])
-
-    # Fraction of alarm steps co-occurring with non-stable
-    alarm_steps  = is_alarm.sum()
-    correct_alarm = (is_alarm & (targets > 0)).sum()
-    precision    = float(correct_alarm / alarm_steps) if alarm_steps > 0 else float("nan")
-
-    return {
-        "n_alarm_episodes":    len(durations),
-        "mean_episode_length": float(np.mean(dur_arr)),
-        "max_episode_length":  int(np.max(dur_arr)),
-        "alarm_precision":     precision,
-        "alarm_rate":          float(is_alarm.mean()),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Multi-horizon early-warning summary
-# ---------------------------------------------------------------------------
-
-def multi_horizon_early_warning(
-    scores:    np.ndarray,   # (N, H)
-    targets:   np.ndarray,   # (N, H)
-    horizons:  List[int],
-    threshold: float = 0.5,
-    lead_time_window: int = 60,
-    unstable_class: int = 2,
-) -> Dict:
-    """Run full early-warning analysis for each prediction horizon.
-
-    Returns
-    -------
-    Dict keyed by ``f"h{horizon}"`` with per-horizon result dicts.
-    """
-    results = {}
-    for h_idx, horizon in enumerate(horizons):
-        s_h = scores[:, h_idx]
-        t_h = targets[:, h_idx]
-        key = f"h{horizon}"
-
-        lt  = lead_time_analysis(s_h, t_h, threshold, lead_time_window, unstable_class)
-        prc = alarm_precision_recall_curve(s_h, t_h,
-                                            lead_time_window=lead_time_window,
-                                            unstable_class=unstable_class)
-        alm = alarm_persistence_analysis(s_h, t_h, threshold, unstable_class)
-
-        results[key] = {"lead_time": lt, "precision_recall": prc, "persistence": alm}
-
-    return results
+        logger.info(f"Early warning report saved to {output_path}")
