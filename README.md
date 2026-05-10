@@ -61,11 +61,11 @@ This is particularly relevant for:
 │  │  Instability Head        │    │  ← Multi-horizon binary prediction
 │  └──────────────────────────┘    │
 └──────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│ Early Warning Score │  ← AUROC, Lead Time, Detection Latency
-└─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Early Warning Score │  ← AUROC, Lead Time, Detection Latency
+        └─────────────────────┘
 ```
 
 ### Model Family
