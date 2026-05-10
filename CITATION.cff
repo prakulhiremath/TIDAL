@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "TIDAL: Temporal AI for Early Detection of Latent Financial Market Instability"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Hiremath"
+    given-names: "Prakul"
+repository-code: "https://github.com/prakulhiremath/TIDAL"
+license: MIT
+version: 1.0.0
+date-released: 2026-05-10
