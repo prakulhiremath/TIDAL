@@ -1,391 +1,354 @@
 """
 evaluation/metrics.py
 ──────────────────────
-Comprehensive evaluation metrics for financial instability detection.
+Comprehensive evaluation metrics for TIDAL instability detection.
 
-All metrics are designed for the three-regime surveillance framing:
-    0 = Stable  |  1 = Transitional  |  2 = Unstable
+Beyond standard classification metrics, implements:
+    - Instability lead time (how early does detection occur?)
+    - Early warning horizon
+    - False alarm rate
+    - Transition sensitivity (performance specifically at regime changes)
+    - Detection latency (delay from instability onset to detection)
 
-Key metrics
------------
-- AUROC / AUPRC          : discrimination power (OVR macro)
-- Transitional recall    : ability to detect the early-warning regime
-- Lead time              : how many steps *before* instability onset a warning fires
-- False alarm rate       : proportion of warnings during stable periods
-- Calibration (ECE)      : reliability of predicted probabilities
-- Bootstrap CIs          : 95% confidence intervals via stratified resampling
-
-Tensor conventions
-------------------
-    probs   : (N, H, C)  — softmax probabilities
-    targets : (N, H)     — int64 regime labels {0,1,2}
-    scores  : (N, H)     — instability score = P(Trans)+P(Unstable)
+These metrics are critical for evaluating proactive surveillance systems,
+where WHEN you detect is as important as WHETHER you detect.
 """
 
-from __future__ import annotations
-
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
-import torch
-from sklearn.calibration import calibration_curve
+import pandas as pd
 from sklearn.metrics import (
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    roc_auc_score,
-    roc_curve,
-    precision_recall_curve,
+    roc_auc_score, average_precision_score,
+    precision_recall_curve, f1_score,
+    precision_score, recall_score, confusion_matrix,
+    classification_report,
 )
+from typing import Dict, List, Optional, Tuple
+from loguru import logger
 
 
-# ---------------------------------------------------------------------------
-# Core classification metrics
-# ---------------------------------------------------------------------------
-
-def compute_auroc(
-    probs: np.ndarray,   # (N, C)
-    targets: np.ndarray, # (N,)
-    multi_class: str = "ovr",
-) -> float:
-    """Macro-averaged AUROC for multi-class regime classification."""
-    if len(np.unique(targets)) < 2:
-        return float("nan")
-    try:
-        return float(roc_auc_score(targets, probs, multi_class=multi_class, average="macro"))
-    except Exception:
-        return float("nan")
-
-
-def compute_auprc(
-    probs: np.ndarray,   # (N, C)
-    targets: np.ndarray, # (N,)
-    num_classes: int = 3,
-) -> float:
-    """Macro-averaged AUPRC (OVR, one class at a time)."""
-    aps = []
-    for c in range(num_classes):
-        binary_t = (targets == c).astype(int)
-        if binary_t.sum() == 0:
-            continue
-        aps.append(average_precision_score(binary_t, probs[:, c]))
-    return float(np.mean(aps)) if aps else float("nan")
-
-
-def compute_f1(
-    preds: np.ndarray,   # (N,) predicted class
-    targets: np.ndarray, # (N,)
-    average: str = "macro",
-) -> float:
-    return float(f1_score(targets, preds, average=average, zero_division=0))
-
-
-def compute_confusion_matrix(
-    preds: np.ndarray,
-    targets: np.ndarray,
-    num_classes: int = 3,
-    normalize: bool = True,
-) -> np.ndarray:
-    cm = confusion_matrix(targets, preds, labels=list(range(num_classes)))
-    if normalize:
-        row_sums = cm.sum(axis=1, keepdims=True).clip(min=1)
-        cm = cm.astype(float) / row_sums
-    return cm
-
-
-# ---------------------------------------------------------------------------
-# Instability-specific metrics
-# ---------------------------------------------------------------------------
-
-def compute_transitional_recall(
-    preds: np.ndarray,
-    targets: np.ndarray,
-    transitional_class: int = 1,
-) -> float:
-    """Recall for the Transitional regime (the early-warning class).
-
-    High transitional recall means the model reliably identifies the
-    latent accumulation phase before observable instability onset.
-    """
-    mask = targets == transitional_class
-    if mask.sum() == 0:
-        return float("nan")
-    return float((preds[mask] == transitional_class).mean())
-
-
-def compute_instability_recall(
-    preds: np.ndarray,
-    targets: np.ndarray,
-    unstable_class: int = 2,
-) -> float:
-    """Recall for the Unstable regime."""
-    mask = targets == unstable_class
-    if mask.sum() == 0:
-        return float("nan")
-    return float((preds[mask] == unstable_class).mean())
-
-
-def compute_false_alarm_rate(
-    scores: np.ndarray,   # (N,) instability score in [0, 1]
-    targets: np.ndarray,  # (N,) int labels
+def compute_binary_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
     threshold: float = 0.5,
-    stable_class: int = 0,
-) -> float:
-    """False alarm rate: proportion of alarms fired during stable periods.
-
-    FA = |{t : score_t ≥ threshold, target_t = 0}| / |{t : target_t = 0}|
-    """
-    stable_mask = targets == stable_class
-    if stable_mask.sum() == 0:
-        return float("nan")
-    alarms_in_stable = (scores[stable_mask] >= threshold).sum()
-    return float(alarms_in_stable / stable_mask.sum())
-
-
-def compute_lead_time(
-    scores: np.ndarray,       # (N,) instability score (temporal sequence)
-    targets: np.ndarray,      # (N,) int labels (temporal sequence)
-    threshold: float = 0.5,
-    lead_time_window: int = 60,
-    unstable_class: int = 2,
+    prefix: str = "",
 ) -> Dict[str, float]:
-    """Compute early-warning lead time statistics.
-
-    For each instability onset event, finds how many steps *before* onset
-    the surveillance score first crossed the alert threshold.
-
-    Parameters
-    ----------
-    scores:
-        Temporal sequence of instability scores (P(Trans)+P(Unstable)).
-    targets:
-        Temporal sequence of ground-truth labels.
-    threshold:
-        Alert threshold for the instability score.
-    lead_time_window:
-        Max steps to look back for a pre-onset warning.
-    unstable_class:
-        Class index for the Unstable regime.
-
-    Returns
-    -------
-    Dict with keys: ``mean_lead_time``, ``median_lead_time``, ``detected_fraction``.
     """
-    # Find instability onset events: first step of each unstable episode
-    is_unstable = (targets == unstable_class).astype(int)
-    onsets = []
-    in_event = False
-    for t in range(len(is_unstable)):
-        if is_unstable[t] == 1 and not in_event:
-            onsets.append(t)
-            in_event = True
-        elif is_unstable[t] == 0:
-            in_event = False
+    Compute comprehensive binary classification metrics.
 
-    if not onsets:
-        return {"mean_lead_time": float("nan"),
-                "median_lead_time": float("nan"),
-                "detected_fraction": float("nan")}
+    Args:
+        y_true: Ground truth binary labels (N,).
+        y_prob: Predicted probabilities (N,).
+        threshold: Decision threshold for binary predictions.
+        prefix: String prefix for metric keys.
+
+    Returns:
+        Dictionary of metric name → value.
+    """
+    y_pred = (y_prob >= threshold).astype(int)
+
+    metrics = {}
+    p = prefix + "_" if prefix else ""
+
+    # ── Standard classification metrics ────────────────────────────────────
+    try:
+        metrics[f"{p}auroc"] = float(roc_auc_score(y_true, y_prob))
+    except Exception:
+        metrics[f"{p}auroc"] = 0.0
+
+    try:
+        metrics[f"{p}auprc"] = float(average_precision_score(y_true, y_prob))
+    except Exception:
+        metrics[f"{p}auprc"] = 0.0
+
+    metrics[f"{p}f1"] = float(f1_score(y_true, y_pred, zero_division=0))
+    metrics[f"{p}precision"] = float(precision_score(y_true, y_pred, zero_division=0))
+    metrics[f"{p}recall"] = float(recall_score(y_true, y_pred, zero_division=0))
+    metrics[f"{p}accuracy"] = float((y_true == y_pred).mean())
+
+    # ── Confusion matrix derived ────────────────────────────────────────────
+    if len(np.unique(y_true)) > 1:
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+        n_neg = tn + fp
+        metrics[f"{p}false_alarm_rate"] = float(fp / max(n_neg, 1))
+        metrics[f"{p}specificity"] = float(tn / max(n_neg, 1))
+        metrics[f"{p}tp"] = int(tp)
+        metrics[f"{p}fp"] = int(fp)
+        metrics[f"{p}tn"] = int(tn)
+        metrics[f"{p}fn"] = int(fn)
+    else:
+        metrics[f"{p}false_alarm_rate"] = 0.0
+        metrics[f"{p}specificity"] = 1.0
+
+    # ── Optimal threshold ───────────────────────────────────────────────────
+    opt_thresh, opt_f1 = find_optimal_threshold(y_true, y_prob)
+    metrics[f"{p}optimal_threshold"] = float(opt_thresh)
+    metrics[f"{p}optimal_f1"] = float(opt_f1)
+
+    return metrics
+
+
+def compute_early_warning_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    instability_episodes: List[Dict],
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    """
+    Compute early warning system performance metrics.
+
+    Focuses on HOW EARLY the system detects upcoming instability.
+
+    Args:
+        y_true: Binary instability labels (T,).
+        y_prob: Predicted probabilities (T,).
+        instability_episodes: List of episode dicts from InstabilityIndex.
+        threshold: Detection threshold.
+
+    Returns:
+        Dict of early warning metrics.
+    """
+    y_pred = (y_prob >= threshold).astype(int)
+    T = len(y_true)
+    metrics = {}
+
+    if not instability_episodes:
+        return {"lead_time_mean": 0.0, "lead_time_std": 0.0, "detection_rate": 0.0}
 
     lead_times = []
-    detected = 0
+    detected = []
 
-    for onset in onsets:
-        start = max(0, onset - lead_time_window)
-        window_scores = scores[start:onset]
-        alarm_steps   = np.where(window_scores >= threshold)[0]
+    for episode in instability_episodes:
+        start = episode["start"]
+        # Look back for earliest detection before episode start
+        lookback = min(start, 100)
+        window = y_pred[max(0, start - lookback): start]
 
-        if len(alarm_steps) > 0:
-            first_alarm   = alarm_steps[0]
-            lead_t        = (onset - start) - first_alarm
-            lead_times.append(lead_t)
-            detected += 1
+        if len(window) > 0 and window.any():
+            # Lead time = steps before episode where prediction was positive
+            first_detection = len(window) - 1 - np.argmax(window[::-1] > 0)
+            lead_time = lookback - first_detection
+            lead_times.append(lead_time)
+            detected.append(True)
+        else:
+            detected.append(False)
 
-    detected_frac = detected / len(onsets)
-    if not lead_times:
-        return {"mean_lead_time": 0.0,
-                "median_lead_time": 0.0,
-                "detected_fraction": float(detected_frac)}
+    metrics["lead_time_mean"] = float(np.mean(lead_times)) if lead_times else 0.0
+    metrics["lead_time_std"] = float(np.std(lead_times)) if lead_times else 0.0
+    metrics["lead_time_max"] = float(np.max(lead_times)) if lead_times else 0.0
+    metrics["detection_rate"] = float(np.mean(detected))
 
-    return {
-        "mean_lead_time":   float(np.mean(lead_times)),
-        "median_lead_time": float(np.median(lead_times)),
-        "detected_fraction": float(detected_frac),
-    }
+    # Detection latency: how long AFTER onset before detection
+    latencies = []
+    for episode in instability_episodes:
+        start = episode["start"]
+        end = episode["end"]
+        episode_preds = y_pred[start:end]
+        if episode_preds.any():
+            latency = np.argmax(episode_preds)
+            latencies.append(latency)
 
+    metrics["detection_latency_mean"] = float(np.mean(latencies)) if latencies else float(end - start)
+    metrics["detection_latency_std"] = float(np.std(latencies)) if latencies else 0.0
 
-# ---------------------------------------------------------------------------
-# Calibration
-# ---------------------------------------------------------------------------
+    # False alarm rate in stable periods
+    stable_mask = y_true == 0
+    if stable_mask.sum() > 0:
+        false_alarms = y_pred[stable_mask].sum()
+        metrics["false_alarm_rate_stable"] = float(false_alarms / stable_mask.sum())
+    else:
+        metrics["false_alarm_rate_stable"] = 0.0
 
-def compute_ece(
-    probs: np.ndarray,    # (N, C)
-    targets: np.ndarray,  # (N,)
-    n_bins: int = 15,
-    num_classes: int = 3,
-) -> float:
-    """Expected Calibration Error (macro-averaged across classes, OVR).
-
-    Lower ECE = better-calibrated probabilities.
-    """
-    eces = []
-    for c in range(num_classes):
-        binary_t = (targets == c).astype(float)
-        p_c = probs[:, c]
-        try:
-            prob_true, prob_pred = calibration_curve(
-                binary_t, p_c, n_bins=n_bins, strategy="quantile"
-            )
-            ece_c = float(np.abs(prob_true - prob_pred).mean())
-        except Exception:
-            ece_c = float("nan")
-        eces.append(ece_c)
-    valid = [v for v in eces if not np.isnan(v)]
-    return float(np.mean(valid)) if valid else float("nan")
+    return metrics
 
 
-def compute_calibration_curve(
-    probs: np.ndarray,    # (N, C)
-    targets: np.ndarray,  # (N,)
-    class_idx: int = 2,
-    n_bins: int = 15,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (fraction_positive, mean_predicted_prob) for one class."""
-    binary_t = (targets == class_idx).astype(float)
-    p_c = probs[:, class_idx]
-    try:
-        prob_true, prob_pred = calibration_curve(
-            binary_t, p_c, n_bins=n_bins, strategy="quantile"
-        )
-    except Exception:
-        prob_true, prob_pred = np.array([0.0, 1.0]), np.array([0.0, 1.0])
-    return prob_true, prob_pred
-
-
-# ---------------------------------------------------------------------------
-# Bootstrap confidence intervals
-# ---------------------------------------------------------------------------
-
-def bootstrap_metric(
-    metric_fn,
-    *args,
-    n_bootstrap: int = 1000,
-    confidence: float = 0.95,
-    seed: int = 42,
+def compute_transition_sensitivity(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    regimes: np.ndarray,
+    threshold: float = 0.5,
+    neighborhood: int = 10,
 ) -> Dict[str, float]:
-    """Compute bootstrap confidence interval for any scalar metric function.
-
-    Parameters
-    ----------
-    metric_fn:
-        Callable that accepts the same positional args and returns a float.
-    *args:
-        Arrays to resample (must all have the same length on axis 0).
-    n_bootstrap:
-        Number of bootstrap replicates.
-    confidence:
-        CI level (0.95 = 95%).
-    seed:
-        Random seed.
-
-    Returns
-    -------
-    Dict with ``estimate``, ``lower``, ``upper``, ``std``.
     """
-    rng = np.random.default_rng(seed)
-    N   = len(args[0])
-    estimates = []
+    Evaluate detection performance specifically at regime transitions.
 
-    for _ in range(n_bootstrap):
-        idx   = rng.integers(0, N, size=N)
-        resampled = [a[idx] for a in args]
-        try:
-            val = metric_fn(*resampled)
-            if not np.isnan(val):
-                estimates.append(val)
-        except Exception:
-            pass
+    Transition sensitivity measures how well the model detects
+    instability near regime change boundaries — the key scientific claim
+    of TIDAL.
 
-    if not estimates:
-        return {"estimate": float("nan"), "lower": float("nan"),
-                "upper": float("nan"), "std": float("nan")}
+    Args:
+        y_true: Binary instability labels (T,).
+        y_prob: Predicted probabilities (T,).
+        regimes: Regime labels {0,1,2} (T,).
+        threshold: Decision threshold.
+        neighborhood: Steps around transition to analyze.
 
-    estimates = np.array(estimates)
-    alpha = 1.0 - confidence
-    return {
-        "estimate": float(np.mean(estimates)),
-        "lower":    float(np.percentile(estimates, 100 * alpha / 2)),
-        "upper":    float(np.percentile(estimates, 100 * (1 - alpha / 2))),
-        "std":      float(np.std(estimates)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Aggregated evaluation report
-# ---------------------------------------------------------------------------
-
-def full_evaluation_report(
-    probs:      np.ndarray,   # (N, H, C)
-    targets:    np.ndarray,   # (N, H)
-    scores:     np.ndarray,   # (N, H) instability scores
-    horizons:   List[int],
-    threshold:  float = 0.5,
-    lead_time_window: int = 60,
-    n_bootstrap: int = 1000,
-    num_classes: int = 3,
-) -> Dict[str, Dict]:
-    """Compute the full suite of evaluation metrics for each prediction horizon.
-
-    Parameters
-    ----------
-    probs:    Softmax probabilities (N, H, C).
-    targets:  Ground-truth labels (N, H).
-    scores:   Instability score = P(Trans)+P(Unstable), shape (N, H).
-    horizons: List of horizon step values (e.g. [10, 30, 60]).
-    threshold, lead_time_window, n_bootstrap, num_classes: see individual functions.
-
-    Returns
-    -------
-    Dict keyed by ``f"h{horizon}"`` with per-horizon metric dicts.
+    Returns:
+        Dict of transition-specific metrics.
     """
-    H = len(horizons)
-    report: Dict[str, Dict] = {}
+    T = len(y_true)
+    y_pred = (y_prob >= threshold).astype(int)
 
-    for h_idx, horizon in enumerate(horizons):
-        p_h = probs[:, h_idx, :]     # (N, C)
-        t_h = targets[:, h_idx]      # (N,)
-        s_h = scores[:, h_idx]       # (N,)
-        pred_h = p_h.argmax(axis=-1) # (N,)
+    # Find all transition points
+    transitions = np.zeros(T, dtype=bool)
+    transitions[1:] = regimes[1:] != regimes[:-1]
+    transition_indices = np.where(transitions)[0]
 
-        auroc = compute_auroc(p_h, t_h)
-        auprc = compute_auprc(p_h, t_h, num_classes)
-        f1    = compute_f1(pred_h, t_h)
-        ece   = compute_ece(p_h, t_h, num_classes=num_classes)
+    if len(transition_indices) == 0:
+        return {"transition_sensitivity": 0.0, "transition_auroc": 0.0}
 
-        trans_recall    = compute_transitional_recall(pred_h, t_h)
-        unstable_recall = compute_instability_recall(pred_h, t_h)
-        far             = compute_false_alarm_rate(s_h, t_h, threshold)
-        lead            = compute_lead_time(s_h, t_h, threshold, lead_time_window)
-        cm              = compute_confusion_matrix(pred_h, t_h, num_classes)
+    # Build transition neighborhood mask
+    trans_mask = np.zeros(T, dtype=bool)
+    for idx in transition_indices:
+        lo = max(0, idx - neighborhood)
+        hi = min(T, idx + neighborhood + 1)
+        trans_mask[lo:hi] = True
 
-        # Bootstrap CI for AUROC
-        auroc_ci = bootstrap_metric(
-            lambda p, t: compute_auroc(p, t),
-            p_h, t_h,
-            n_bootstrap=n_bootstrap,
-        )
+    # Metrics within transition neighborhoods
+    y_true_trans = y_true[trans_mask]
+    y_prob_trans = y_prob[trans_mask]
+    y_pred_trans = y_pred[trans_mask]
 
-        report[f"h{horizon}"] = {
-            "auroc":              auroc,
-            "auprc":              auprc,
-            "macro_f1":           f1,
-            "ece":                ece,
-            "transitional_recall": trans_recall,
-            "unstable_recall":    unstable_recall,
-            "false_alarm_rate":   far,
-            "lead_time":          lead,
-            "auroc_ci":           auroc_ci,
-            "confusion_matrix":   cm.tolist(),
-        }
+    metrics = {}
+    metrics["n_transition_steps"] = int(trans_mask.sum())
+    metrics["n_transitions"] = int(len(transition_indices))
 
-    return report
+    if len(y_true_trans) > 0 and len(np.unique(y_true_trans)) > 1:
+        metrics["transition_auroc"] = float(roc_auc_score(y_true_trans, y_prob_trans))
+        metrics["transition_recall"] = float(recall_score(y_true_trans, y_pred_trans, zero_division=0))
+        metrics["transition_precision"] = float(precision_score(y_true_trans, y_pred_trans, zero_division=0))
+        metrics["transition_f1"] = float(f1_score(y_true_trans, y_pred_trans, zero_division=0))
+    else:
+        metrics["transition_auroc"] = 0.0
+        metrics["transition_recall"] = 0.0
+        metrics["transition_precision"] = 0.0
+        metrics["transition_f1"] = 0.0
+
+    # Performance specifically on Stable→Transitional→Unstable sequences
+    stable_to_trans = []
+    for i in range(1, T):
+        if regimes[i - 1] == 0 and regimes[i] == 1:
+            stable_to_trans.append(i)
+
+    metrics["n_stable_to_transitional"] = len(stable_to_trans)
+
+    # Detection probability in transitional periods preceding instability
+    trans_period_detected = []
+    for t in transition_indices:
+        if t > 0 and regimes[t - 1] == 1 and regimes[t] == 2:
+            # Stable → Transitional → Unstable: look back in transitional period
+            lookback_start = max(0, t - 20)
+            window_preds = y_pred[lookback_start:t]
+            trans_period_detected.append(window_preds.any())
+
+    if trans_period_detected:
+        metrics["transitional_detection_rate"] = float(np.mean(trans_period_detected))
+    else:
+        metrics["transitional_detection_rate"] = 0.0
+
+    return metrics
+
+
+def compute_multiclass_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_names: List[str] = ["Stable", "Transitional", "Unstable"],
+) -> Dict[str, float]:
+    """
+    Compute multi-class classification metrics for regime prediction.
+
+    Args:
+        y_true: True regime labels {0,1,2} (T,).
+        y_pred: Predicted regime labels {0,1,2} (T,).
+        class_names: Human-readable class names.
+
+    Returns:
+        Dict of multi-class metrics.
+    """
+    metrics = {}
+
+    # Per-class F1
+    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+    for i, name in enumerate(class_names):
+        if i < len(f1_per_class):
+            metrics[f"f1_{name.lower()}"] = float(f1_per_class[i])
+
+    metrics["f1_macro"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    metrics["f1_weighted"] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    metrics["accuracy"] = float((y_true == y_pred).mean())
+
+    return metrics
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    metric: str = "f1",
+) -> Tuple[float, float]:
+    """
+    Find the decision threshold that maximizes a given metric.
+
+    Args:
+        y_true: Binary ground truth (N,).
+        y_prob: Predicted probabilities (N,).
+        metric: Metric to maximize: 'f1', 'recall', 'precision'.
+
+    Returns:
+        Tuple of (optimal_threshold, optimal_metric_value).
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+
+    best_thresh = 0.5
+    best_score = 0.0
+
+    for i, thresh in enumerate(thresholds):
+        p, r = precisions[i], recalls[i]
+        if metric == "f1":
+            score = 2 * p * r / (p + r + 1e-8)
+        elif metric == "recall":
+            score = r
+        elif metric == "precision":
+            score = p
+        else:
+            score = 2 * p * r / (p + r + 1e-8)
+
+        if score > best_score:
+            best_score = score
+            best_thresh = thresh
+
+    return best_thresh, best_score
+
+
+def format_metrics_table(
+    results: Dict[str, Dict[str, float]],
+    metrics_to_show: Optional[List[str]] = None,
+) -> str:
+    """
+    Format a results dictionary as a publication-ready LaTeX table.
+
+    Args:
+        results: Dict of model_name → metrics dict.
+        metrics_to_show: List of metric keys to include.
+
+    Returns:
+        LaTeX table string.
+    """
+    if metrics_to_show is None:
+        metrics_to_show = ["auroc", "f1", "precision", "recall", "false_alarm_rate"]
+
+    rows = []
+    for model_name, metrics in results.items():
+        row = {"Model": model_name}
+        for m in metrics_to_show:
+            val = metrics.get(m, metrics.get(f"_{m}", 0.0))
+            row[m.upper()] = f"{val:.3f}"
+        rows.append(row)
+
+    df = pd.DataFrame(rows).set_index("Model")
+
+    # LaTeX output
+    latex = df.to_latex(
+        bold_rows=True,
+        caption="TIDAL vs. Baseline Instability Detection Performance",
+        label="tab:main_results",
+    )
+    return latex
