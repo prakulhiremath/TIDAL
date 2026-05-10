@@ -36,19 +36,19 @@ This is particularly relevant for:
 ## Architecture
 
 ```
-Market Microstructure Stream
-         │
-         ▼
-┌─────────────────────┐
-│ Feature Engineering │  ← LOB features, spread, imbalance, volatility
-└─────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  Sequence Builder   │  ← Sliding windows, multi-horizon labels
-└─────────────────────┘
-         │
-         ▼
+        Market Microstructure Stream
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │ Feature Engineering │  ← LOB features, spread, imbalance, volatility
+        └─────────────────────┘
+                 │
+                 ▼
+        ┌─────────────────────┐
+        │  Sequence Builder   │  ← Sliding windows, multi-horizon labels
+        └─────────────────────┘
+                 │
+                 ▼
 ┌──────────────────────────────────┐
 │         TIDAL Model              │
 │  ┌──────────────────────────┐    │
