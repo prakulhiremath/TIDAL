@@ -51,20 +51,20 @@ Market Microstructure Stream
          ▼
 ┌──────────────────────────────────┐
 │         TIDAL Model              │
-│  ┌──────────────────────────┐   │
-│  │  Temporal Encoder         │   │  ← Convolutional + Recurrent layers
-│  └──────────────────────────┘   │
-│  ┌──────────────────────────┐   │
-│  │  Latent Regime Module     │   │  ← Hidden stress state representation
-│  └──────────────────────────┘   │
-│  ┌──────────────────────────┐   │
-│  │  Instability Head         │   │  ← Multi-horizon binary prediction
-│  └──────────────────────────┘   │
+│  ┌──────────────────────────┐    │
+│  │  Temporal Encoder        │    │  ← Convolutional + Recurrent layers
+│  └──────────────────────────┘    │
+│  ┌──────────────────────────┐    │
+│  │  Latent Regime Module    │    │  ← Hidden stress state representation
+│  └──────────────────────────┘    │
+│  ┌──────────────────────────┐    │
+│  │  Instability Head        │    │  ← Multi-horizon binary prediction
+│  └──────────────────────────┘    │
 └──────────────────────────────────┘
          │
          ▼
 ┌─────────────────────┐
-│  Early Warning Score │  ← AUROC, Lead Time, Detection Latency
+│ Early Warning Score │  ← AUROC, Lead Time, Detection Latency
 └─────────────────────┘
 ```
 
