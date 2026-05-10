@@ -1,320 +1,359 @@
 """
 evaluation/benchmark_compare.py
 ─────────────────────────────────
-Statistical benchmark comparison between TIDAL and baseline models.
+Cross-model benchmark comparison for TIDAL.
 
-Provides:
-- Side-by-side metric tables (AUROC, AUPRC, F1, ECE, lead time)
-- Pairwise statistical significance testing (Wilcoxon signed-rank)
-- Bootstrap-based confidence intervals for all comparisons
-- Relative improvement percentage tables
-- Publication-ready summary tables
+Loads saved model results, computes statistical comparisons,
+and generates publication-ready summary tables.
+
+Includes:
+    - Pairwise significance testing
+    - Bootstrap confidence intervals
+    - LaTeX table generation
+    - HTML report generation
 """
 
-from __future__ import annotations
-
 import json
+import numpy as np
+import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from loguru import logger
 
-import numpy as np
-from scipy import stats
-
-
-# ---------------------------------------------------------------------------
-# Metric table construction
-# ---------------------------------------------------------------------------
-
-MODEL_ORDER = ["TIDAL", "LSTM", "Transformer", "SSM"]
-
-METRIC_DISPLAY = {
-    "auroc":               "AUROC ↑",
-    "auprc":               "AUPRC ↑",
-    "macro_f1":            "Macro-F1 ↑",
-    "ece":                 "ECE ↓",
-    "transitional_recall": "Trans. Recall ↑",
-    "false_alarm_rate":    "FAR ↓",
-    "mean_lead_time":      "Lead Time (steps) ↑",
-    "detection_rate":      "Detection Rate ↑",
-}
+from evaluation.metrics import format_metrics_table
 
 
-def build_comparison_table(
-    results: Dict[str, Dict],
-    horizon: str = "h10",
-    metrics: Optional[List[str]] = None,
-) -> Dict[str, Dict[str, float]]:
-    """Build a model × metric comparison table for a given horizon.
-
-    Parameters
-    ----------
-    results:
-        Dict mapping model name → evaluation report (as returned by
-        ``full_evaluation_report``).
-    horizon:
-        Horizon key, e.g. ``"h10"`` or ``"h30"``.
-    metrics:
-        Metric keys to include. Defaults to all METRIC_DISPLAY keys.
-
-    Returns
-    -------
-    Dict: {metric_name: {model_name: value}}.
+class BenchmarkComparison:
     """
-    if metrics is None:
-        metrics = list(METRIC_DISPLAY.keys())
+    Aggregate and compare results across all TIDAL baseline models.
 
-    table: Dict[str, Dict[str, float]] = {m: {} for m in metrics}
-
-    for model_name, report in results.items():
-        h_report = report.get(horizon, {})
-        for metric in metrics:
-            # Lead time is nested
-            if metric in ("mean_lead_time", "detection_rate"):
-                lt = h_report.get("lead_time", {})
-                val = lt.get(metric, float("nan"))
-            else:
-                val = h_report.get(metric, float("nan"))
-            table[metric][model_name] = val
-
-    return table
-
-
-def format_comparison_table(
-    table: Dict[str, Dict[str, float]],
-    bold_best: bool = True,
-) -> str:
-    """Format a comparison table as a markdown/ASCII string.
-
-    Parameters
-    ----------
-    table:
-        Output from ``build_comparison_table``.
-    bold_best:
-        If True, mark the best model per metric with *.
-
-    Returns
-    -------
-    Formatted string table.
+    Usage:
+        compare = BenchmarkComparison()
+        compare.add_result("TIDAL", tidal_metrics)
+        compare.add_result("LSTM", lstm_metrics)
+        table = compare.generate_latex_table()
+        compare.save_all("results/tables/")
     """
-    models = sorted({m for row in table.values() for m in row})
-    header = f"{'Metric':<28}" + "".join(f"{m:>14}" for m in models)
-    lines  = [header, "-" * len(header)]
 
-    for metric, row in table.items():
-        display = METRIC_DISPLAY.get(metric, metric)
-        higher_is_better = not display.endswith("↓")
-        vals = [row.get(m, float("nan")) for m in models]
+    MODEL_ORDER = [
+        "Logistic Regression", "XGBoost",
+        "LSTM", "Transformer", "SSM", "TIDAL"
+    ]
 
-        if bold_best and not all(np.isnan(v) for v in vals):
-            valid_vals = [v for v in vals if not np.isnan(v)]
-            best_val = max(valid_vals) if higher_is_better else min(valid_vals)
-        else:
-            best_val = None
+    def __init__(self, horizons: List[int] = [10, 30, 60]):
+        self.horizons = horizons
+        self.results: Dict[str, Dict] = {}
+        self.raw_predictions: Dict[str, Dict[str, np.ndarray]] = {}
 
-        row_str = f"{display:<28}"
-        for m, v in zip(models, vals):
-            cell = f"{v:.4f}" if not np.isnan(v) else "  N/A"
-            if bold_best and best_val is not None and not np.isnan(v):
-                if abs(v - best_val) < 1e-8:
-                    cell = f"*{cell}"
-            row_str += f"{cell:>14}"
-        lines.append(row_str)
+    def add_result(
+        self,
+        model_name: str,
+        metrics: Dict[str, float],
+        predictions: Optional[Dict[str, np.ndarray]] = None,
+    ) -> None:
+        """
+        Register a model's evaluation results.
 
-    return "\n".join(lines)
+        Args:
+            model_name: Display name of the model.
+            metrics: Metric dictionary from compute_binary_metrics.
+            predictions: Optional dict of raw prediction arrays for stat tests.
+        """
+        self.results[model_name] = metrics
+        if predictions:
+            self.raw_predictions[model_name] = predictions
+        logger.info(f"Registered results: {model_name} | AUROC={metrics.get('auroc', 0):.4f}")
 
+    def generate_main_table(
+        self,
+        horizon: int = 10,
+        metrics: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """
+        Generate the main results comparison DataFrame.
 
-# ---------------------------------------------------------------------------
-# Statistical significance testing
-# ---------------------------------------------------------------------------
+        Args:
+            horizon: Horizon to report (default: shortest = h10).
+            metrics: Metric names to include.
 
-def wilcoxon_test(
-    scores_a: np.ndarray,   # (N,) metric values (bootstrap replicates or per-sample)
-    scores_b: np.ndarray,   # (N,)
-    alternative: str = "two-sided",
-) -> Dict[str, float]:
-    """Wilcoxon signed-rank test between two paired score arrays.
+        Returns:
+            DataFrame with models as rows, metrics as columns.
+        """
+        if metrics is None:
+            metrics = ["auroc", "auprc", "f1", "precision", "recall",
+                       "false_alarm_rate", "lead_time_mean"]
 
-    Parameters
-    ----------
-    scores_a, scores_b:
-        Paired score arrays (same length N).
-    alternative:
-        ``"two-sided"`` | ``"greater"`` | ``"less"``.
-
-    Returns
-    -------
-    Dict with ``statistic``, ``p_value``, ``significant`` (at α=0.05).
-    """
-    if len(scores_a) != len(scores_b):
-        raise ValueError("Score arrays must have the same length.")
-
-    diff = scores_a - scores_b
-    if np.all(diff == 0):
-        return {"statistic": 0.0, "p_value": 1.0, "significant": False}
-
-    try:
-        stat, p = stats.wilcoxon(scores_a, scores_b, alternative=alternative)
-    except Exception:
-        stat, p = float("nan"), float("nan")
-
-    return {
-        "statistic":   float(stat),
-        "p_value":     float(p),
-        "significant": bool(p < 0.05) if not np.isnan(p) else False,
-    }
-
-
-def pairwise_significance_matrix(
-    bootstrap_results: Dict[str, np.ndarray],
-    metric: str = "auroc",
-    alternative: str = "two-sided",
-) -> Dict[str, Dict[str, Dict]]:
-    """Pairwise Wilcoxon tests between all model pairs.
-
-    Parameters
-    ----------
-    bootstrap_results:
-        Dict mapping model name → 1D array of bootstrap AUROC estimates
-        (or any scalar metric estimates).
-    metric:
-        Label for the metric being compared (informational only).
-    alternative:
-        Wilcoxon alternative hypothesis.
-
-    Returns
-    -------
-    Nested dict: {model_a: {model_b: test_result}}.
-    """
-    models  = list(bootstrap_results.keys())
-    results = {m: {} for m in models}
-
-    for i, m_a in enumerate(models):
-        for j, m_b in enumerate(models):
-            if i == j:
-                results[m_a][m_b] = {"statistic": 0.0, "p_value": 1.0, "significant": False}
+        rows = []
+        for model_name in self.MODEL_ORDER:
+            if model_name not in self.results:
                 continue
-            test = wilcoxon_test(
-                bootstrap_results[m_a], bootstrap_results[m_b], alternative
+
+            m = self.results[model_name]
+            row = {"Model": model_name}
+            for metric in metrics:
+                # Try horizon-specific first, fall back to global
+                val = m.get(f"{metric}_h{horizon}", m.get(metric, None))
+                if val is None:
+                    val = 0.0
+                row[metric.upper()] = val
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).set_index("Model")
+        return df
+
+    def generate_latex_table(
+        self,
+        horizon: int = 10,
+        bold_best: bool = True,
+    ) -> str:
+        """
+        Generate LaTeX-formatted main results table.
+
+        Args:
+            horizon: Horizon to display.
+            bold_best: Bold the best value per column.
+
+        Returns:
+            LaTeX table string.
+        """
+        df = self.generate_main_table(horizon=horizon)
+        if df.empty:
+            return "% No results to display"
+
+        # Bold best value per column
+        if bold_best:
+            df_display = df.copy()
+            for col in df.columns:
+                is_lower_better = col in ["FALSE_ALARM_RATE"]
+                if is_lower_better:
+                    best_idx = df[col].idxmin()
+                else:
+                    best_idx = df[col].idxmax()
+                df_display.loc[best_idx, col] = f"\\textbf{{{df.loc[best_idx, col]:.3f}}}"
+                for idx in df.index:
+                    if idx != best_idx:
+                        try:
+                            df_display.loc[idx, col] = f"{float(df.loc[idx, col]):.3f}"
+                        except Exception:
+                            pass
+
+            latex = df_display.to_latex(
+                escape=False,
+                caption=f"Instability Detection Performance at Horizon h={horizon} (TIDAL vs. Baselines)",
+                label=f"tab:results_h{horizon}",
             )
-            results[m_a][m_b] = test
+        else:
+            latex = df.round(3).to_latex(
+                caption=f"Results at h={horizon}",
+                label=f"tab:results_h{horizon}",
+            )
 
-    return results
+        return latex
 
+    def generate_multi_horizon_table(self) -> pd.DataFrame:
+        """
+        Generate AUROC comparison across all horizons and models.
 
-# ---------------------------------------------------------------------------
-# Relative improvement analysis
-# ---------------------------------------------------------------------------
+        Returns:
+            DataFrame with models as rows, horizons as columns.
+        """
+        rows = []
+        for model_name in self.MODEL_ORDER:
+            if model_name not in self.results:
+                continue
+            m = self.results[model_name]
+            row = {"Model": model_name}
+            for h in self.horizons:
+                val = m.get(f"auroc_h{h}", m.get("auroc", 0.0))
+                row[f"AUROC h={h}"] = round(val, 3)
+            rows.append(row)
 
-def compute_relative_improvements(
-    table: Dict[str, Dict[str, float]],
-    baseline_model: str = "LSTM",
-    target_model:   str = "TIDAL",
-) -> Dict[str, float]:
-    """Compute relative improvement of target over baseline for each metric.
+        return pd.DataFrame(rows).set_index("Model")
 
-    Positive values mean target is better; sign is adjusted for ↓ metrics.
+    def pairwise_significance_test(
+        self,
+        model_a: str,
+        model_b: str,
+        metric: str = "auroc",
+        horizon: int = 10,
+        n_bootstrap: int = 1000,
+        seed: int = 42,
+    ) -> Dict[str, float]:
+        """
+        Bootstrap significance test comparing two models.
 
-    Returns
-    -------
-    Dict mapping metric name → relative improvement (%).
-    """
-    improvements = {}
-    for metric, row in table.items():
-        baseline = row.get(baseline_model, float("nan"))
-        target   = row.get(target_model,   float("nan"))
+        Uses bootstrap resampling to estimate p-value for the hypothesis
+        that model_a outperforms model_b on a given metric.
 
-        if np.isnan(baseline) or np.isnan(target) or baseline == 0:
-            improvements[metric] = float("nan")
-            continue
+        Args:
+            model_a: First model name (assumed better).
+            model_b: Second model name.
+            metric: Metric to compare.
+            horizon: Prediction horizon.
+            n_bootstrap: Number of bootstrap samples.
+            seed: Random seed.
 
-        display = METRIC_DISPLAY.get(metric, "")
-        higher_is_better = not display.endswith("↓")
+        Returns:
+            Dict with 'p_value', 'delta_mean', 'delta_ci_lower', 'delta_ci_upper'.
+        """
+        key = f"{metric}_h{horizon}"
 
-        rel = (target - baseline) / (abs(baseline) + 1e-8) * 100.0
-        if not higher_is_better:
-            rel = -rel  # Flip sign so positive always means "better"
+        # Need raw predictions for proper bootstrap
+        if model_a in self.raw_predictions and model_b in self.raw_predictions:
+            return self._bootstrap_metric_test(
+                model_a, model_b, metric, horizon, n_bootstrap, seed
+            )
 
-        improvements[metric] = float(rel)
+        # Fallback: report point estimate difference only
+        val_a = self.results.get(model_a, {}).get(key, self.results.get(model_a, {}).get(metric, 0))
+        val_b = self.results.get(model_b, {}).get(key, self.results.get(model_b, {}).get(metric, 0))
+        delta = val_a - val_b
 
-    return improvements
-
-
-# ---------------------------------------------------------------------------
-# Summary report builder
-# ---------------------------------------------------------------------------
-
-def build_benchmark_report(
-    results: Dict[str, Dict],
-    horizons: Optional[List[str]] = None,
-    save_dir: Optional[str | Path] = None,
-) -> Dict:
-    """Build a complete benchmark comparison report.
-
-    Parameters
-    ----------
-    results:
-        Dict mapping model name → per-horizon evaluation report.
-    horizons:
-        Horizon keys to include (default: all found in first model's report).
-    save_dir:
-        If provided, save the report as JSON and formatted text.
-
-    Returns
-    -------
-    Full benchmark report dict.
-    """
-    if horizons is None:
-        first = next(iter(results.values()))
-        horizons = [k for k in first.keys() if k.startswith("h")]
-
-    report: Dict = {"horizons": {}}
-
-    for horizon in horizons:
-        table = build_comparison_table(results, horizon)
-        formatted = format_comparison_table(table)
-
-        # Relative improvements vs LSTM baseline
-        improvements = {}
-        if "LSTM" in results and "TIDAL" in results:
-            improvements = compute_relative_improvements(table, "LSTM", "TIDAL")
-
-        report["horizons"][horizon] = {
-            "table":        table,
-            "formatted":    formatted,
-            "improvements": improvements,
+        return {
+            "delta_mean": float(delta),
+            "p_value": None,  # Cannot compute without raw predictions
+            "note": "Point estimate only — provide raw predictions for bootstrap test",
         }
 
-    if save_dir is not None:
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
+    def _bootstrap_metric_test(
+        self,
+        model_a: str,
+        model_b: str,
+        metric: str,
+        horizon: int,
+        n_bootstrap: int,
+        seed: int,
+    ) -> Dict[str, float]:
+        """Bootstrap-based significance test using raw predictions."""
+        from sklearn.metrics import roc_auc_score, f1_score
+        rng = np.random.default_rng(seed)
 
-        # JSON
-        def _jsonify(obj):
-            if isinstance(obj, dict):
-                return {k: _jsonify(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [_jsonify(v) for v in obj]
-            elif isinstance(obj, (np.floating, float)):
-                return round(float(obj), 6) if not np.isnan(obj) else None
-            return obj
+        preds_a = self.raw_predictions[model_a]
+        preds_b = self.raw_predictions[model_b]
 
-        with open(save_dir / "benchmark_report.json", "w") as f:
-            json.dump(_jsonify(report), f, indent=2)
+        y_true = preds_a.get(f"y_true_h{horizon}", preds_a.get("y_true"))
+        probs_a = preds_a.get(f"probs_h{horizon}", preds_a.get("probs"))
+        probs_b = preds_b.get(f"probs_h{horizon}", preds_b.get("probs"))
 
-        # Text tables
-        with open(save_dir / "benchmark_tables.txt", "w") as f:
-            for horizon in horizons:
-                f.write(f"\n{'='*60}\n")
-                f.write(f"  Benchmark Comparison — Horizon {horizon}\n")
-                f.write(f"{'='*60}\n")
-                f.write(report["horizons"][horizon]["formatted"])
-                f.write("\n\n")
+        if y_true is None or probs_a is None or probs_b is None:
+            return {"p_value": None, "note": "Missing raw prediction arrays"}
 
-                if report["horizons"][horizon]["improvements"]:
-                    f.write("  TIDAL vs LSTM — Relative Improvement (%):\n")
-                    for metric, pct in report["horizons"][horizon]["improvements"].items():
-                        if not np.isnan(pct):
-                            sign = "+" if pct > 0 else ""
-                            f.write(f"    {metric:<28}: {sign}{pct:.1f}%\n")
+        N = len(y_true)
+        deltas = []
 
-    return report
+        for _ in range(n_bootstrap):
+            idx = rng.choice(N, size=N, replace=True)
+            y_b = y_true[idx]
+            p_a = probs_a[idx]
+            p_b = probs_b[idx]
+
+            if len(np.unique(y_b)) < 2:
+                continue
+
+            if metric == "auroc":
+                score_a = roc_auc_score(y_b, p_a)
+                score_b = roc_auc_score(y_b, p_b)
+            elif metric == "f1":
+                score_a = f1_score(y_b, (p_a > 0.5).astype(int), zero_division=0)
+                score_b = f1_score(y_b, (p_b > 0.5).astype(int), zero_division=0)
+            else:
+                score_a = roc_auc_score(y_b, p_a)
+                score_b = roc_auc_score(y_b, p_b)
+
+            deltas.append(score_a - score_b)
+
+        deltas = np.array(deltas)
+        p_value = float((deltas <= 0).mean())  # One-sided: P(delta <= 0)
+
+        return {
+            "delta_mean": float(deltas.mean()),
+            "delta_std": float(deltas.std()),
+            "delta_ci_lower": float(np.percentile(deltas, 2.5)),
+            "delta_ci_upper": float(np.percentile(deltas, 97.5)),
+            "p_value": p_value,
+            "significant_p05": bool(p_value < 0.05),
+        }
+
+    def save_all(self, output_dir: str) -> None:
+        """
+        Save all comparison tables and reports.
+
+        Args:
+            output_dir: Directory to save outputs.
+        """
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # Main results tables per horizon
+        for h in self.horizons:
+            df = self.generate_main_table(horizon=h)
+            if not df.empty:
+                df.round(3).to_csv(out / f"results_h{h}.csv")
+                latex = self.generate_latex_table(horizon=h)
+                (out / f"results_h{h}.tex").write_text(latex)
+
+        # Multi-horizon AUROC table
+        mh_df = self.generate_multi_horizon_table()
+        if not mh_df.empty:
+            mh_df.to_csv(out / "multi_horizon_auroc.csv")
+            mh_df.round(3).to_latex(
+                out / "multi_horizon_auroc.tex",
+                caption="AUROC across prediction horizons",
+                label="tab:multi_horizon",
+            )
+
+        # JSON dump of all results
+        with open(out / "all_results.json", "w") as f:
+            json.dump(
+                {k: {mk: float(mv) for mk, mv in v.items() if isinstance(mv, (int, float, np.floating))}
+                 for k, v in self.results.items()},
+                f, indent=2
+            )
+
+        logger.info(f"All comparison tables saved to {out}")
+
+    def print_summary(self) -> None:
+        """Print a clean summary of all model results to stdout."""
+        if not self.results:
+            print("No results registered yet.")
+            return
+
+        print("\n" + "="*70)
+        print("TIDAL BENCHMARK COMPARISON SUMMARY")
+        print("="*70)
+
+        df = self.generate_multi_horizon_table()
+        if not df.empty:
+            print(df.to_string())
+
+        print("\n" + "="*70)
+
+
+def main():
+    """CLI entrypoint for benchmark comparison."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TIDAL Benchmark Comparison")
+    parser.add_argument("--results_dir", default="results", help="Results directory")
+    parser.add_argument("--output_dir", default="results/tables", help="Output directory")
+    args = parser.parse_args()
+
+    # Load saved results
+    results_path = Path(args.results_dir)
+    compare = BenchmarkComparison()
+
+    for result_file in results_path.glob("**/metrics.json"):
+        model_name = result_file.parent.name
+        with open(result_file) as f:
+            metrics = json.load(f)
+        compare.add_result(model_name, metrics)
+
+    compare.print_summary()
+    compare.save_all(args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
