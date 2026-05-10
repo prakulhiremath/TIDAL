@@ -1,560 +1,441 @@
 """
 training/trainer.py
 ────────────────────
-Config-driven training engine for all TIDAL model architectures.
+Universal training loop for all TIDAL models.
 
-Features
---------
-- Multi-horizon cross-entropy loss with focal weighting
-- Mixed-precision (AMP) training on CUDA, auto-disabled elsewhere
-- Gradient clipping
-- LR scheduling with linear warm-up
-- Early stopping
-- ModelCheckpoint (best + last)
-- TensorBoard logging (optional)
-- Per-epoch metric tracking (AUROC, AUPRC, loss, F1)
-- Full reproducibility via seeded DataLoaders
-- Config-driven: all hyper-params come from OmegaConf DictConfig
-
-Tensor conventions (unchanged from existing codebase)
-------------------------------------------------------
-    x       : (B, T, F)         — feature sequences
-    y       : (B, H)            — int64 regime labels, H = num horizons
-    logits  : (B, H, C)         — raw model output
-    probs   : (B, H, C)         — softmax over class dim
+Supports:
+    - Deep learning models (TIDAL, LSTM, Transformer, SSM)
+    - Sklearn-compatible baselines (Logistic Regression, XGBoost)
+    - Multi-horizon label training
+    - Early stopping with best model checkpointing
+    - TensorBoard logging
+    - Gradient clipping
+    - Learning rate scheduling
 """
 
-from __future__ import annotations
-
-import json
+import os
 import time
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
+import json
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from omegaconf import DictConfig
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Callable
+from loguru import logger
 
-from training.callbacks import (
-    EarlyStopping,
-    LRSchedulerCallback,
-    MetricTracker,
-    ModelCheckpoint,
-)
-from utils.config import get_device, get_output_dir
-from utils.logger import get_logger
-from utils.seed import set_seed
-
-log = get_logger(__name__)
+from training.losses import MultiHorizonLoss
+from training.callbacks import EarlyStopping, ModelCheckpoint, LRSchedulerCallback
+from evaluation.metrics import compute_binary_metrics
 
 
-# ---------------------------------------------------------------------------
-# Loss builder (multi-class, multi-horizon, compatible with model output)
-# ---------------------------------------------------------------------------
+class TIDALTrainer:
+    """
+    Universal trainer for TIDAL and baseline deep learning models.
 
-class MultiHorizonCELoss(nn.Module):
-    """Weighted cross-entropy loss summed across prediction horizons.
+    Handles the full training lifecycle:
+        - Epoch loop with train/val passes
+        - Multi-horizon label unpacking
+        - Metric tracking and logging
+        - Early stopping and checkpointing
+        - Final model evaluation
 
-    Works with model output shape ``(B, H, C)`` and label shape ``(B, H)``.
-
-    Parameters
-    ----------
-    num_horizons:
-        Number of prediction horizons (H).
-    horizon_weights:
-        Per-horizon scalar weights. Defaults to the config value.
-    class_weights:
-        Tensor of shape ``(C,)`` for class imbalance handling.
-    focal_gamma:
-        Focal modulation (0 = standard CE, >0 = focal).
+    Usage:
+        trainer = TIDALTrainer(model, optimizer, loss_fn, cfg)
+        results = trainer.fit(train_loader, val_loader)
     """
 
     def __init__(
         self,
-        num_horizons: int,
-        horizon_weights: Optional[torch.Tensor] = None,
-        class_weights: Optional[torch.Tensor] = None,
-        focal_gamma: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.num_horizons  = num_horizons
-        self.focal_gamma   = focal_gamma
-        self.register_buffer(
-            "horizon_weights",
-            horizon_weights if horizon_weights is not None
-            else torch.ones(num_horizons) / num_horizons,
-        )
-        self.register_buffer(
-            "class_weights",
-            class_weights,  # may be None
-        )
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Compute weighted multi-horizon loss.
-
-        Parameters
-        ----------
-        logits  : (B, H, C)
-        targets : (B, H)   int64
-
-        Returns
-        -------
-        Scalar loss.
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        loss_fn: nn.Module,
+        cfg: dict,
+        device: Optional[torch.device] = None,
+        experiment_name: str = "tidal",
+    ):
         """
-        total = torch.tensor(0.0, device=logits.device)
-        for h in range(self.num_horizons):
-            l_h = logits[:, h, :]   # (B, C)
-            t_h = targets[:, h]     # (B,)
+        Initialize trainer.
 
-            ce = F.cross_entropy(
-                l_h, t_h,
-                weight=self.class_weights,
-                reduction="none",
-            )  # (B,)
+        Args:
+            model: PyTorch model to train.
+            optimizer: Configured optimizer.
+            loss_fn: Loss function (MultiHorizonLoss).
+            cfg: Full experiment config dict.
+            device: Compute device. Auto-detected if None.
+            experiment_name: Name for logging and checkpointing.
+        """
+        self.model = model
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.cfg = cfg
+        self.experiment_name = experiment_name
 
-            if self.focal_gamma > 0.0:
-                p_t = F.softmax(l_h, dim=-1).gather(1, t_h.unsqueeze(1)).squeeze(1)
-                focal_w = (1.0 - p_t) ** self.focal_gamma
-                ce = focal_w * ce
+        # Device
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+        self.model.to(self.device)
 
-            total = total + self.horizon_weights[h] * ce.mean()
-
-        return total
-
-
-def _build_loss(cfg: DictConfig, class_weights: Optional[torch.Tensor] = None) -> MultiHorizonCELoss:
-    """Instantiate loss from config."""
-    lc         = cfg.training.loss
-    n_horizons = len(cfg.data.horizons)
-    hw_list    = list(cfg.training.get("horizon_weights", [1.0 / n_horizons] * n_horizons))
-    hw         = torch.tensor(hw_list, dtype=torch.float32)
-    focal_gamma = float(lc.get("focal_gamma", 0.0)) if lc.get("type", "ce") == "focal" else 0.0
-
-    return MultiHorizonCELoss(
-        num_horizons   = n_horizons,
-        horizon_weights = hw,
-        class_weights  = class_weights,
-        focal_gamma    = focal_gamma,
-    )
-
-
-def _build_optimizer(cfg: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
-    name = cfg.training.optimizer.lower()
-    lr   = float(cfg.training.lr)
-    wd   = float(cfg.training.weight_decay)
-
-    if name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    elif name == "adam":
-        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    elif name == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
-    else:
-        raise ValueError(f"Unknown optimizer: {name}")
-
-
-# ---------------------------------------------------------------------------
-# Per-batch metric helpers
-# ---------------------------------------------------------------------------
-
-def _compute_batch_metrics(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-) -> Dict[str, float]:
-    """Accuracy and per-class counts for a single batch (cheap, no sklearn)."""
-    preds   = logits.argmax(dim=-1)  # (B, H)
-    correct = (preds == targets).float().mean().item()
-    return {"acc": correct}
-
-
-# ---------------------------------------------------------------------------
-# Epoch-level AUROC / AUPRC via sklearn (deferred import)
-# ---------------------------------------------------------------------------
-
-def _epoch_metrics(
-    all_probs:   torch.Tensor,  # (N, H, C)
-    all_targets: torch.Tensor,  # (N, H)
-    num_classes: int = 3,
-) -> Dict[str, float]:
-    """Compute AUROC, AUPRC, macro-F1 over the full epoch."""
-    from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
-    import numpy as np
-
-    probs   = all_probs.cpu().numpy()    # (N, H, C)
-    targets = all_targets.cpu().numpy()  # (N, H)
-    N, H, C = probs.shape
-
-    auroc_list, auprc_list, f1_list = [], [], []
-
-    for h in range(H):
-        t_h = targets[:, h]
-        p_h = probs[:, h, :]
-
-        # AUROC (OVR, macro average across classes)
-        try:
-            if len(np.unique(t_h)) > 1:
-                auroc = roc_auc_score(t_h, p_h, multi_class="ovr", average="macro")
-            else:
-                auroc = float("nan")
-        except Exception:
-            auroc = float("nan")
-
-        # AUPRC averaged across classes OVR
-        auprc_per_class = []
-        for c in range(C):
-            binary_t = (t_h == c).astype(int)
-            if binary_t.sum() > 0:
-                auprc_per_class.append(average_precision_score(binary_t, p_h[:, c]))
-        auprc = float(np.mean(auprc_per_class)) if auprc_per_class else float("nan")
-
-        preds = p_h.argmax(axis=-1)
-        f1    = f1_score(t_h, preds, average="macro", zero_division=0)
-
-        auroc_list.append(auroc)
-        auprc_list.append(auprc)
-        f1_list.append(f1)
-
-    def _safe_mean(lst):
-        valid = [v for v in lst if not np.isnan(v)]
-        return float(np.mean(valid)) if valid else 0.0
-
-    return {
-        "auroc":     _safe_mean(auroc_list),
-        "auprc":     _safe_mean(auprc_list),
-        "macro_f1":  _safe_mean(f1_list),
-        **{f"auroc_h{h}": auroc_list[h] for h in range(H)},
-    }
-
-
-# ---------------------------------------------------------------------------
-# Trainer
-# ---------------------------------------------------------------------------
-
-class Trainer:
-    """Full training engine for TIDAL models.
-
-    Parameters
-    ----------
-    model:
-        Any model with ``forward(x) -> (B, H, C)`` interface.
-    cfg:
-        Full OmegaConf experiment config.
-    class_weights:
-        Optional float32 tensor of shape ``(C,)`` for loss weighting.
-
-    Usage
-    -----
-    ::
-
-        trainer = Trainer(model, cfg)
-        history = trainer.fit(train_loader, val_loader)
-        results = trainer.evaluate(test_loader)
-    """
-
-    def __init__(
-        self,
-        model:         nn.Module,
-        cfg:           DictConfig,
-        class_weights: Optional[torch.Tensor] = None,
-    ) -> None:
-        self.cfg          = cfg
-        self.device       = get_device(cfg)
-        self.model        = model.to(self.device)
-        self.num_horizons = len(cfg.data.horizons)
-        self.num_classes  = cfg.model.num_classes
-
-        # Move class weights to device
-        if class_weights is not None:
-            class_weights = class_weights.to(self.device)
-
-        # Loss
-        self.criterion = _build_loss(cfg, class_weights).to(self.device)
-
-        # Optimizer
-        self.optimizer = _build_optimizer(cfg, model)
-
-        # LR scheduler
-        self.lr_scheduler = LRSchedulerCallback(
-            optimizer       = self.optimizer,
-            scheduler_name  = cfg.training.get("lr_scheduler", "cosine"),
-            total_epochs    = cfg.training.epochs,
-            warmup_epochs   = cfg.training.get("lr_warmup_epochs", 3),
-            cfg_training    = cfg.training,
-        )
-
-        # AMP scaler (CUDA only)
-        self.use_amp = (
-            cfg.training.get("mixed_precision", False)
-            and self.device.type == "cuda"
-        )
-        self.scaler = GradScaler() if self.use_amp else None
-
-        # Callbacks
-        es_cfg = cfg.training.early_stopping
-        self.early_stopping = EarlyStopping(
-            patience  = es_cfg.patience,
-            monitor   = es_cfg.monitor,
-            mode      = es_cfg.mode,
-            min_delta = es_cfg.min_delta,
-        )
-
-        ck_cfg = cfg.training.checkpointing
-        ckpt_dir = Path(cfg.experiment.checkpoint_dir) / cfg.experiment.name
-        self.checkpoint = ModelCheckpoint(
-            checkpoint_dir      = ckpt_dir,
-            monitor             = es_cfg.monitor,
-            mode                = es_cfg.mode,
-            save_best           = ck_cfg.save_best,
-            save_last           = ck_cfg.save_last,
-            save_every_n_epochs = ck_cfg.save_every_n_epochs,
-        )
-
-        self.metric_tracker = MetricTracker()
+        # Paths
+        log_cfg = cfg.get("logging", {})
+        self.checkpoint_dir = Path(log_cfg.get("checkpoint_dir", "results/checkpoints"))
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir = Path(log_cfg.get("log_dir", "logs")) / experiment_name
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # TensorBoard
         self.writer: Optional[SummaryWriter] = None
-        if cfg.logging.get("tensorboard", False):
-            log_dir = Path(cfg.experiment.log_dir) / cfg.experiment.name
-            log_dir.mkdir(parents=True, exist_ok=True)
-            self.writer = SummaryWriter(log_dir=str(log_dir))
+        if log_cfg.get("tensorboard", True):
+            self.writer = SummaryWriter(log_dir=str(self.log_dir))
 
-        self._gradient_clip = float(cfg.training.get("gradient_clip", 1.0))
-        self._log_every_n   = cfg.logging.get("log_every_n_steps", 50)
+        # Training config
+        train_cfg = cfg.get("training", {})
+        self.max_epochs = train_cfg.get("max_epochs", 100)
+        self.grad_clip = train_cfg.get("gradient_clip", 1.0)
+        self.log_every = log_cfg.get("log_every_n_steps", 50)
 
-        log.info(
-            f"Trainer ready | device={self.device} | AMP={self.use_amp} | "
-            f"params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+        # Horizons
+        self.horizons = cfg.get("labeling", {}).get("horizons", [10, 30, 60])
+
+        # Callbacks
+        self.early_stopping = EarlyStopping(
+            patience=train_cfg.get("early_stopping_patience", 15),
+            mode="max",  # Maximize AUROC
+        )
+        self.checkpoint = ModelCheckpoint(
+            dirpath=self.checkpoint_dir,
+            filename=f"{experiment_name}_best",
+            monitor="val_auroc",
+            mode="max",
         )
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
+        # Scheduler
+        scheduler_name = train_cfg.get("scheduler", "cosine")
+        self.scheduler = self._build_scheduler(scheduler_name)
+
+        # History
+        self.history: Dict[str, List[float]] = {
+            "train_loss": [], "val_loss": [],
+            "val_auroc": [], "val_f1": [],
+        }
+
+        logger.info(f"Trainer initialized: device={self.device}, model={type(model).__name__}")
 
     def fit(
         self,
         train_loader: DataLoader,
-        val_loader:   DataLoader,
-        resume_from:  Optional[str | Path] = None,
+        val_loader: DataLoader,
     ) -> Dict[str, Any]:
-        """Run the full training loop.
-
-        Parameters
-        ----------
-        train_loader, val_loader:
-            PyTorch DataLoaders returning ``(x, y)`` batches.
-        resume_from:
-            Optional path to a checkpoint to resume from.
-
-        Returns
-        -------
-        Dict containing ``history`` (MetricTracker dict) and ``best_epoch``.
         """
-        start_epoch = 0
-        if resume_from is not None:
-            payload     = ModelCheckpoint.load_checkpoint(
-                resume_from, self.model, self.device, self.optimizer
-            )
-            start_epoch = payload.get("epoch", 0) + 1
-            log.info(f"Resuming from epoch {start_epoch}")
+        Run the full training loop.
 
-        for epoch in range(start_epoch, self.cfg.training.epochs):
-            t0 = time.time()
+        Args:
+            train_loader: Training data loader.
+            val_loader: Validation data loader.
 
-            train_metrics = self._train_epoch(train_loader, epoch)
-            val_metrics   = self._eval_epoch(val_loader, prefix="val")
+        Returns:
+            Dictionary of training results and final metrics.
+        """
+        logger.info(f"Starting training: max_epochs={self.max_epochs}")
+        best_val_auroc = 0.0
+        global_step = 0
 
-            metrics = {**{f"train_{k}": v for k, v in train_metrics.items()},
-                       **{f"val_{k}":   v for k, v in val_metrics.items()}}
+        for epoch in range(1, self.max_epochs + 1):
+            t_start = time.time()
 
-            lr = self.lr_scheduler.step(epoch, val_metric=val_metrics.get("auroc"))
-            metrics["lr"] = lr
+            # ── Train epoch ─────────────────────────────────────────────────
+            train_loss = self._train_epoch(train_loader, epoch, global_step)
+            self.history["train_loss"].append(train_loss)
 
-            self.metric_tracker.update(metrics)
+            # ── Validation ──────────────────────────────────────────────────
+            val_metrics = self._val_epoch(val_loader)
+            self.history["val_loss"].append(val_metrics["loss"])
+            self.history["val_auroc"].append(val_metrics.get("auroc_h10", 0.0))
+            self.history["val_f1"].append(val_metrics.get("f1_h10", 0.0))
 
-            # Logging
-            elapsed = time.time() - t0
-            log.info(
-                f"Epoch {epoch:03d}/{self.cfg.training.epochs} | "
-                f"train_loss={train_metrics['loss']:.4f} | "
-                f"val_auroc={val_metrics.get('auroc', 0):.4f} | "
-                f"val_auprc={val_metrics.get('auprc', 0):.4f} | "
-                f"lr={lr:.2e} | {elapsed:.1f}s"
-            )
+            epoch_time = time.time() - t_start
+            val_auroc = val_metrics.get("auroc_h10", 0.0)
 
-            if self.writer:
-                for k, v in metrics.items():
-                    self.writer.add_scalar(k, v, epoch)
-
-            # Checkpoint
-            self.checkpoint.step(
-                model=self.model, metrics=metrics, epoch=epoch,
-                optimizer=self.optimizer,
-                extra={"early_stopping": self.early_stopping.state_dict()},
+            logger.info(
+                f"Epoch {epoch:03d}/{self.max_epochs} | "
+                f"train_loss={train_loss:.4f} | "
+                f"val_auroc={val_auroc:.4f} | "
+                f"val_f1={val_metrics.get('f1_h10', 0):.4f} | "
+                f"time={epoch_time:.1f}s"
             )
 
-            # Early stopping (uses prefixed key "val_auroc" etc.)
-            es_monitor = self.cfg.training.early_stopping.monitor  # e.g. "val_auroc"
-            if self.early_stopping.step(metrics, epoch):
+            # ── TensorBoard logging ─────────────────────────────────────────
+            if self.writer is not None:
+                self.writer.add_scalar("Loss/train", train_loss, epoch)
+                self.writer.add_scalar("Loss/val", val_metrics["loss"], epoch)
+                for k, v in val_metrics.items():
+                    if k != "loss":
+                        self.writer.add_scalar(f"Val/{k}", v, epoch)
+
+            # ── Checkpoint ──────────────────────────────────────────────────
+            self.checkpoint(self.model, val_auroc, epoch)
+            if val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+
+            # ── LR Scheduler ────────────────────────────────────────────────
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_auroc)
+                else:
+                    self.scheduler.step()
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                if self.writer:
+                    self.writer.add_scalar("LR", current_lr, epoch)
+
+            # ── Early stopping ──────────────────────────────────────────────
+            if self.early_stopping(val_auroc):
+                logger.info(f"Early stopping triggered at epoch {epoch}")
                 break
+
+        # ── Load best model and return ──────────────────────────────────────
+        best_path = self.checkpoint.best_model_path
+        if best_path and Path(best_path).exists():
+            self.model.load_state_dict(torch.load(best_path, map_location=self.device))
+            logger.info(f"Loaded best model from {best_path}")
 
         if self.writer:
             self.writer.close()
 
-        # Save full metric history
-        self._save_history()
-
-        return {
-            "history":    self.metric_tracker.to_dict(),
-            "best_epoch": self.early_stopping.best_epoch,
-            "best_value": self.early_stopping.best_value,
+        results = {
+            "best_val_auroc": best_val_auroc,
+            "history": self.history,
+            "best_model_path": str(best_path) if best_path else None,
+            "epochs_trained": len(self.history["train_loss"]),
         }
+        self._save_history(results)
+        return results
 
     def _train_epoch(
-        self, loader: DataLoader, epoch: int
-    ) -> Dict[str, float]:
+        self, loader: DataLoader, epoch: int, global_step: int
+    ) -> float:
+        """Run one training epoch."""
         self.model.train()
         total_loss = 0.0
-        n_batches  = 0
+        n_batches = 0
 
-        for step, (x, y) in enumerate(loader):
-            x = x.to(self.device, non_blocking=True)  # (B, T, F)
-            y = y.to(self.device, non_blocking=True)   # (B, H)
+        for batch_idx, (sequences, label_dict) in enumerate(loader):
+            sequences = sequences.to(self.device)
 
-            self.optimizer.zero_grad(set_to_none=True)
+            # Build multi-horizon target tensor (B, n_horizons)
+            targets = self._build_target_tensor(label_dict)
 
-            with autocast(enabled=self.use_amp):
-                logits = self.model(x)      # (B, H, C)
-                loss   = self.criterion(logits, y)
+            # Forward
+            self.optimizer.zero_grad()
+            output = self.model(sequences)
+            logits = output["logits"]
 
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self._gradient_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self._gradient_clip)
-                self.optimizer.step()
+            loss = self.loss_fn(logits, targets)
+            loss.backward()
 
+            if self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+            self.optimizer.step()
             total_loss += loss.item()
-            n_batches  += 1
+            n_batches += 1
 
-            if (step + 1) % self._log_every_n == 0:
-                log.debug(f"  step {step+1}/{len(loader)} | loss={loss.item():.4f}")
+            if (batch_idx + 1) % self.log_every == 0:
+                logger.debug(
+                    f"  Epoch {epoch} | step {batch_idx+1}/{len(loader)} | "
+                    f"loss={loss.item():.4f}"
+                )
 
-        return {"loss": total_loss / max(n_batches, 1)}
+        return total_loss / max(n_batches, 1)
 
     @torch.no_grad()
-    def _eval_epoch(
-        self, loader: DataLoader, prefix: str = "val"
-    ) -> Dict[str, float]:
+    def _val_epoch(self, loader: DataLoader) -> Dict[str, float]:
+        """Run validation and compute full metrics."""
         self.model.eval()
-        total_loss   = 0.0
-        n_batches    = 0
-        all_probs    = []
-        all_targets  = []
+        all_logits, all_targets = [], []
+        total_loss = 0.0
+        n_batches = 0
 
-        for x, y in loader:
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
+        for sequences, label_dict in loader:
+            sequences = sequences.to(self.device)
+            targets = self._build_target_tensor(label_dict)
 
-            logits = self.model(x)            # (B, H, C)
-            loss   = self.criterion(logits, y)
+            output = self.model(sequences)
+            logits = output["logits"]
+            loss = self.loss_fn(logits, targets)
+
             total_loss += loss.item()
-            n_batches  += 1
+            n_batches += 1
+            all_logits.append(logits.cpu())
+            all_targets.append(targets.cpu())
 
-            probs = F.softmax(logits, dim=-1)  # (B, H, C)
-            all_probs.append(probs.cpu())
-            all_targets.append(y.cpu())
+        all_logits = torch.cat(all_logits, dim=0).numpy()
+        all_targets = torch.cat(all_targets, dim=0).numpy()
+        all_probs = 1 / (1 + np.exp(-all_logits))
 
-        all_probs   = torch.cat(all_probs,   dim=0)  # (N, H, C)
-        all_targets = torch.cat(all_targets, dim=0)  # (N, H)
+        metrics = {"loss": total_loss / max(n_batches, 1)}
 
-        epoch_m = _epoch_metrics(all_probs, all_targets, self.num_classes)
-        epoch_m["loss"] = total_loss / max(n_batches, 1)
-        return epoch_m
+        for i, h in enumerate(self.horizons):
+            h_metrics = compute_binary_metrics(
+                all_targets[:, i], all_probs[:, i], threshold=0.5
+            )
+            for k, v in h_metrics.items():
+                metrics[f"{k}_h{h}"] = v
 
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
+        return metrics
 
-    @torch.no_grad()
-    def evaluate(
-        self,
-        test_loader: DataLoader,
-        load_best:   bool = True,
-    ) -> Dict[str, Any]:
-        """Full test-set evaluation.
-
-        Parameters
-        ----------
-        test_loader:
-            DataLoader for the held-out test split.
-        load_best:
-            If True, load the best checkpoint before evaluating.
-
-        Returns
-        -------
-        Dict with metrics, per-sample predictions, and probabilities.
+    def _build_target_tensor(
+        self, label_dict: Dict[str, torch.Tensor]
+    ) -> torch.Tensor:
         """
-        if load_best and self.checkpoint.best_path is not None:
-            self.checkpoint.load_best(self.model, self.device)
+        Stack per-horizon labels into a (B, n_horizons) tensor.
 
-        self.model.eval()
-        all_probs   = []
-        all_targets = []
-        all_scores  = []
+        Args:
+            label_dict: Dict mapping horizon key → (B,) tensor.
 
-        for x, y in test_loader:
-            x = x.to(self.device, non_blocking=True)
-            y = y.to(self.device, non_blocking=True)
+        Returns:
+            (B, n_horizons) float tensor.
+        """
+        horizon_tensors = []
+        for h in self.horizons:
+            key = f"instability_h{h}"
+            if key in label_dict:
+                horizon_tensors.append(label_dict[key].float())
+            else:
+                # Fallback to zeros if horizon not available
+                sample = next(iter(label_dict.values()))
+                horizon_tensors.append(torch.zeros_like(sample).float())
 
-            logits = self.model(x)
-            probs  = F.softmax(logits, dim=-1)
-            # Instability score: P(Trans) + P(Unstable)
-            score  = probs[:, :, 1:].sum(dim=-1)  # (B, H)
+        return torch.stack(horizon_tensors, dim=1).to(self.device)
 
-            all_probs.append(probs.cpu())
-            all_targets.append(y.cpu())
-            all_scores.append(score.cpu())
+    def _build_scheduler(
+        self, name: str
+    ) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+        """Build LR scheduler from config name."""
+        if name == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.max_epochs
+            )
+        elif name == "step":
+            return torch.optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=30, gamma=0.5
+            )
+        elif name == "plateau":
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode="max", patience=5, factor=0.5
+            )
+        return None
 
-        all_probs   = torch.cat(all_probs,   dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
-        all_scores  = torch.cat(all_scores,  dim=0)
+    def _save_history(self, results: dict) -> None:
+        """Save training history to JSON."""
+        history_path = self.log_dir / "training_history.json"
+        serializable = {
+            k: v if not isinstance(v, list) else [float(x) if isinstance(x, (np.floating, np.integer)) else x for x in v]
+            for k, v in results.items()
+            if k != "history"
+        }
+        serializable["history"] = {
+            k: [float(x) for x in v]
+            for k, v in results["history"].items()
+        }
+        with open(history_path, "w") as f:
+            json.dump(serializable, f, indent=2)
+        logger.info(f"Training history saved to {history_path}")
 
-        metrics = _epoch_metrics(all_probs, all_targets, self.num_classes)
-        log.info(
-            f"Test results | auroc={metrics['auroc']:.4f} | "
-            f"auprc={metrics['auprc']:.4f} | f1={metrics['macro_f1']:.4f}"
-        )
 
-        # Save results JSON
-        out_dir = get_output_dir(self.cfg)
-        results_path = out_dir / "test_results.json"
-        with open(results_path, "w") as f:
-            json.dump({k: round(v, 6) for k, v in metrics.items()}, f, indent=2)
-        log.info(f"Test results saved → {results_path}")
+class SklearnTrainer:
+    """
+    Trainer wrapper for sklearn-compatible baseline models
+    (Logistic Regression, XGBoost).
+
+    Usage:
+        trainer = SklearnTrainer(model, cfg)
+        results = trainer.fit(X_train, y_train, X_val, y_val)
+    """
+
+    def __init__(self, model: Any, cfg: dict, model_name: str = "baseline"):
+        self.model = model
+        self.cfg = cfg
+        self.model_name = model_name
+        self.horizons = cfg.get("labeling", {}).get("horizons", [10, 30, 60])
+
+        ckpt_dir = cfg.get("logging", {}).get("checkpoint_dir", "results/checkpoints")
+        self.checkpoint_dir = Path(ckpt_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> Dict[str, Any]:
+        """
+        Train sklearn model and evaluate on validation set.
+
+        Args:
+            X_train: Flattened training sequences (N, window*features).
+            y_train: Binary instability labels (N,).
+            X_val: Validation sequences.
+            y_val: Validation labels.
+
+        Returns:
+            Results dictionary with metrics.
+        """
+        logger.info(f"Training {self.model_name}: X_train={X_train.shape}")
+        t0 = time.time()
+
+        self.model.fit(X_train, y_train)
+
+        elapsed = time.time() - t0
+        logger.info(f"Training complete in {elapsed:.1f}s")
+
+        # Predict
+        if hasattr(self.model, "predict_proba"):
+            probs = self.model.predict_proba(X_val)[:, 1]
+        else:
+            probs = self.model.predict(X_val).astype(float)
+
+        metrics = compute_binary_metrics(y_val, probs, threshold=0.5)
+        logger.info(f"Val metrics: AUROC={metrics.get('auroc', 0):.4f}, F1={metrics.get('f1', 0):.4f}")
+
+        # Save model
+        import joblib
+        model_path = self.checkpoint_dir / f"{self.model_name}_best.joblib"
+        joblib.dump(self.model, model_path)
+        logger.info(f"Model saved to {model_path}")
 
         return {
-            "metrics":     metrics,
-            "probs":       all_probs,
-            "targets":     all_targets,
-            "scores":      all_scores,
-            "results_path": str(results_path),
+            "model_name": self.model_name,
+            "val_metrics": metrics,
+            "training_time": elapsed,
+            "model_path": str(model_path),
         }
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
-    def _save_history(self) -> None:
-        out_dir = get_output_dir(self.cfg)
-        hist_path = out_dir / "training_history.json"
-        with open(hist_path, "w") as f:
-            json.dump(self.metric_tracker.to_dict(), f, indent=2)
-        log.info(f"Training history saved → {hist_path}")
+def build_optimizer(model: nn.Module, cfg: dict) -> torch.optim.Optimizer:
+    """
+    Build optimizer from config.
+
+    Args:
+        model: PyTorch model.
+        cfg: Training config dict.
+
+    Returns:
+        Configured optimizer.
+    """
+    train_cfg = cfg.get("training", {})
+    name = train_cfg.get("optimizer", "adam")
+    lr = train_cfg.get("learning_rate", 0.001)
+    wd = train_cfg.get("weight_decay", 0.0001)
+
+    if name == "adam":
+        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    elif name == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    elif name == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+    else:
+        raise ValueError(f"Unknown optimizer: {name}")
